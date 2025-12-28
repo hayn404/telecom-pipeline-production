@@ -1,0 +1,120 @@
+version: '3.8'
+
+# Telecom Pipeline - Production Lakehouse Architecture
+# Offline deployment configuration
+
+networks:
+  telecom-prod-network:
+    driver: bridge
+    name: telecom-prod-network
+
+volumes:
+  telecom-prod-clickhouse-data:
+    name: telecom-prod-clickhouse-data
+
+services:
+  # ClickHouse Database - Production
+  telecom_prod_clickhouse:
+    image: telecom-prod-clickhouse:23.8
+    container_name: telecom-prod-clickhouse
+    restart: unless-stopped
+    ports:
+      - "30012:8123"  # HTTP interface (production port)
+      - "30013:9000"  # Native protocol (production port)
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_MAX_MEMORY_USAGE: 30000000000
+    volumes:
+      - telecom-prod-clickhouse-data:/var/lib/clickhouse
+      - ./clickhouse/init_lakehouse.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./data/parquet:/var/lib/clickhouse/user_files/parquet  # Parquet data lake
+      - ./wldif:/wldif:ro
+      - ./dump:/dump:ro
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    networks:
+      - telecom-prod-network
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 32G
+        reservations:
+          memory: 16G
+
+  # Spark Processor - Production (On-demand)
+  # Optimized for large files with chunked processing
+  # Processes both UDC_Details (to Parquet) and MNP files (to ClickHouse)
+  telecom_prod_spark_processor:
+    image: telecom-prod-spark-processor:v1.0
+    container_name: telecom-prod-spark-processor
+    environment:
+      LDIF_DIR: /wldif
+      PARQUET_DIR: /data/parquet
+      CDR_DATE: ${CDR_DATE:-}
+      SPARK_EXECUTOR_MEMORY: 4g
+      SPARK_DRIVER_MEMORY: 4g
+      MAX_CORES: 32                # Limit to 25% of 128 cores
+      CHUNK_SIZE: 500000           # Process 500K entries at a time (reduces memory)
+      # ClickHouse connection for MNP data insertion
+      CLICKHOUSE_HOST: telecom_prod_clickhouse
+      CLICKHOUSE_PORT: 8123
+    volumes:
+      - ./wldif:/wldif:ro
+      - ./data/parquet:/data/parquet
+    networks:
+      - telecom-prod-network
+    depends_on:
+      telecom_prod_clickhouse:
+        condition: service_healthy
+    profiles:
+      - processor
+    cpus: 32  # Limit CPU usage to 32 cores (25% of 128)
+    mem_limit: 10g  # Hard memory limit
+    memswap_limit: 10g  # No swap
+    deploy:
+      resources:
+        limits:
+          cpus: '32'
+          memory: 10G
+        reservations:
+          cpus: '16'
+          memory: 6G
+
+  # Streamlit Dashboard - Production
+  telecom_prod_streamlit_app:
+    image: telecom-prod-streamlit-app:v1.0
+    container_name: telecom-prod-streamlit-app
+    restart: unless-stopped
+    ports:
+      - "30014:8501"  # Streamlit (production port)
+    environment:
+      CLICKHOUSE_HOST: telecom_prod_clickhouse
+      CLICKHOUSE_PORT: 8123
+    volumes:
+      - ./data/parquet:/data/parquet:ro
+      - ./streamlit-app/app.py:/app/app.py:ro  # Live reload - changes reflect immediately
+    networks:
+      - telecom-prod-network
+    depends_on:
+      telecom_prod_clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G

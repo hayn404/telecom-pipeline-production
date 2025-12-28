@@ -1,0 +1,29 @@
+# Data files - exclude large/sensitive data
+data/
+dump/
+wldif/
+
+# Docker images (large tar files)
+docker-images/*.tar
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Environment files
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
