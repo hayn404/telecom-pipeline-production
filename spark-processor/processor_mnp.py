@@ -250,6 +250,72 @@ def insert_to_clickhouse(aggregated_data: Dict[tuple, int], detailed_records: li
         raise
 
 
+def insert_to_clickhouse_no_delete(aggregated_data: Dict[tuple, int], detailed_records: list, cdr_date: str):
+    """
+    Insert MNP data into ClickHouse WITHOUT deleting first.
+    Used when processing multiple files for the same date (delete is done once before all files).
+    """
+    try:
+        import clickhouse_connect
+        from datetime import datetime as dt
+
+        # Convert date string to date object
+        if isinstance(cdr_date, str):
+            date_obj = dt.strptime(cdr_date, '%Y-%m-%d').date()
+        else:
+            date_obj = cdr_date
+
+        client = clickhouse_connect.get_client(
+            host=CLICKHOUSE_HOST,
+            port=CLICKHOUSE_PORT,
+            username='default',
+            password=''
+        )
+
+        # Insert aggregated data into MNP table
+        agg_rows = []
+        for (prefix, value), count in aggregated_data.items():
+            agg_rows.append([date_obj, prefix, value, count])
+
+        if agg_rows:
+            client.insert(
+                'default.MNP',
+                agg_rows,
+                column_names=['Date', 'Prefix', 'value', 'Count']
+            )
+            logger.info(f"  Inserted {len(agg_rows)} rows into MNP table (aggregated)")
+
+        # Insert detailed records into MNP_details table
+        if detailed_records:
+            detail_rows = []
+            for record in detailed_records:
+                detail_rows.append([
+                    date_obj,
+                    record['MSISDN'],
+                    record['Prefix'],
+                    record['NPREFIX'],
+                    record['SUBSTYPE'],
+                    record['source_file']
+                ])
+
+            # Insert in batches of 10000 to avoid memory issues
+            batch_size = 10000
+            for i in range(0, len(detail_rows), batch_size):
+                batch = detail_rows[i:i + batch_size]
+                client.insert(
+                    'default.MNP_details',
+                    batch,
+                    column_names=['Date', 'MSISDN', 'Prefix', 'NPREFIX', 'SUBSTYPE', 'source_file']
+                )
+            logger.info(f"  Inserted {len(detail_rows):,} rows into MNP_details table")
+
+        client.close()
+
+    except Exception as e:
+        logger.error(f"Error inserting to ClickHouse: {e}")
+        raise
+
+
 def find_mnp_files(ldif_dir: str) -> list:
     """
     Find all MNP LDIF files in the directory.
@@ -277,6 +343,28 @@ def extract_date_from_filename(filename: str) -> str:
     return None
 
 
+def delete_mnp_data_for_date(cdr_date: str):
+    """Delete existing MNP data for a specific date (called once per date, not per file)"""
+    try:
+        import clickhouse_connect
+
+        client = clickhouse_connect.get_client(
+            host=CLICKHOUSE_HOST,
+            port=CLICKHOUSE_PORT,
+            username='default',
+            password=''
+        )
+
+        logger.info(f"  Deleting existing MNP data for date: {cdr_date}")
+        client.command(f"ALTER TABLE default.MNP DELETE WHERE Date = '{cdr_date}'")
+        client.command(f"ALTER TABLE default.MNP_details DELETE WHERE Date = '{cdr_date}'")
+        logger.info(f"  Deleted existing data for {cdr_date}")
+        client.close()
+
+    except Exception as e:
+        logger.error(f"Error deleting MNP data for {cdr_date}: {e}")
+
+
 def main():
     """Main entry point for MNP processing"""
     logger.info("=" * 60)
@@ -296,6 +384,20 @@ def main():
         return
 
     logger.info(f"Found {len(mnp_files)} MNP files to process")
+
+    # Group files by date and delete existing data ONCE per date (not per file)
+    files_by_date = {}
+    for mnp_file in mnp_files:
+        file_date = extract_date_from_filename(mnp_file.name) or CDR_DATE
+        if file_date not in files_by_date:
+            files_by_date[file_date] = []
+        files_by_date[file_date].append(mnp_file)
+
+    logger.info(f"Files grouped into {len(files_by_date)} unique dates")
+
+    # Delete existing data for all dates BEFORE processing any files
+    for date_to_delete in files_by_date.keys():
+        delete_mnp_data_for_date(date_to_delete)
 
     # Process each MNP file
     total_records = 0
@@ -319,8 +421,8 @@ def main():
             # Process and aggregate
             aggregated_data, detailed_records = process_mnp_file(str(mnp_file), file_date)
 
-            # Insert to ClickHouse
-            insert_to_clickhouse(aggregated_data, detailed_records, file_date)
+            # Insert to ClickHouse (no longer deletes - already deleted above)
+            insert_to_clickhouse_no_delete(aggregated_data, detailed_records, file_date)
 
             file_records = len(detailed_records)
             total_records += file_records
