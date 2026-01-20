@@ -316,9 +316,10 @@ def insert_to_clickhouse_no_delete(aggregated_data: Dict[tuple, int], detailed_r
         raise
 
 
-def find_mnp_files(ldif_dir: str) -> list:
+def find_mnp_files(ldif_dir: str, target_date: str = None) -> list:
     """
-    Find all MNP LDIF files in the directory.
+    Find MNP LDIF files in the directory.
+    If target_date is provided (YYYY-MM-DD), only returns files matching that date.
     MNP files are named like: MNP_31_202511300627.ldif or MNP_*.ldif.gz
     """
     mnp_files = []
@@ -326,6 +327,21 @@ def find_mnp_files(ldif_dir: str) -> list:
 
     for pattern in ['MNP_*.ldif', 'MNP_*.ldif.gz']:
         mnp_files.extend(ldif_path.glob(pattern))
+
+    # If target_date is specified, filter to only files matching that date
+    if target_date:
+        # Convert YYYY-MM-DD to YYYYMMDD for filename matching
+        date_pattern = target_date.replace('-', '')
+        filtered_files = []
+        for f in mnp_files:
+            if date_pattern in f.name:
+                filtered_files.append(f)
+
+        if filtered_files:
+            logger.info(f"Filtering MNP files for date {target_date}: found {len(filtered_files)} of {len(mnp_files)} files")
+            return sorted(filtered_files)
+        else:
+            logger.warning(f"No MNP files found for date {target_date}, will process all {len(mnp_files)} files")
 
     return sorted(mnp_files)
 
@@ -371,19 +387,20 @@ def main():
     logger.info("MNP LDIF Processor - Mobile Number Portability")
     logger.info("=" * 60)
     logger.info(f"LDIF Directory: {LDIF_DIR}")
-    logger.info(f"Default CDR Date: {CDR_DATE}")
+    logger.info(f"Target CDR Date: {CDR_DATE}")
     logger.info(f"ClickHouse: {CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}")
     logger.info("=" * 60)
 
-    # Find MNP files
-    mnp_files = find_mnp_files(LDIF_DIR)
+    # Find MNP files - if CDR_DATE is set, only process files for that date
+    # This prevents reprocessing old MNP files every day
+    mnp_files = find_mnp_files(LDIF_DIR, target_date=CDR_DATE)
 
     if not mnp_files:
         logger.warning(f"No MNP files found in {LDIF_DIR}")
         logger.info("Looking for files matching: MNP_*.ldif or MNP_*.ldif.gz")
         return
 
-    logger.info(f"Found {len(mnp_files)} MNP files to process")
+    logger.info(f"Found {len(mnp_files)} MNP files to process for date {CDR_DATE}")
 
     # Group files by date and delete existing data ONCE per date (not per file)
     files_by_date = {}

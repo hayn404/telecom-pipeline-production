@@ -342,9 +342,9 @@ def delete_parquet_for_date(parquet_dir: str, cdr_date: str):
 
 def process_ldif_files_to_parquet(spark: SparkSession, ldif_dir: str, parquet_dir: str, cdr_date: str):
     """
-    Process all LDIF files and save to partitioned Parquet files.
+    Process UDC LDIF files and save to partitioned Parquet files.
     Uses chunked processing for memory efficiency.
-    Separates UDC_Details files from MNP files.
+    Only processes files matching cdr_date to avoid reprocessing old files.
     """
     # Find all LDIF files
     all_files = []
@@ -356,12 +356,25 @@ def process_ldif_files_to_parquet(spark: SparkSession, ldif_dir: str, parquet_di
         return
 
     # Separate UDC files from MNP files
-    ldif_files = [f for f in all_files if not is_mnp_file(str(f))]
+    all_ldif_files = [f for f in all_files if not is_mnp_file(str(f))]
     mnp_files = [f for f in all_files if is_mnp_file(str(f))]
 
     logger.info(f"Found {len(all_files)} total LDIF files:")
-    logger.info(f"  - {len(ldif_files)} UDC_Details files (for Parquet processing)")
+    logger.info(f"  - {len(all_ldif_files)} UDC_Details files total")
     logger.info(f"  - {len(mnp_files)} MNP files (will be processed separately)")
+
+    # Filter UDC files to only process files for target date
+    # This prevents reprocessing old files every day
+    if cdr_date:
+        date_pattern = cdr_date.replace('-', '')
+        ldif_files = [f for f in all_ldif_files if date_pattern in f.name]
+        if ldif_files:
+            logger.info(f"Filtering UDC files for date {cdr_date}: found {len(ldif_files)} of {len(all_ldif_files)} files")
+        else:
+            logger.warning(f"No UDC files found for date {cdr_date}, will process all {len(all_ldif_files)} files")
+            ldif_files = all_ldif_files
+    else:
+        ldif_files = all_ldif_files
 
     if not ldif_files:
         logger.warning(f"No UDC_Details LDIF files found in {ldif_dir}")
@@ -369,7 +382,7 @@ def process_ldif_files_to_parquet(spark: SparkSession, ldif_dir: str, parquet_di
             logger.info("MNP files found - run processor_mnp.py to process them")
         return
 
-    logger.info(f"Processing {len(ldif_files)} UDC_Details LDIF files")
+    logger.info(f"Processing {len(ldif_files)} UDC_Details LDIF files for date {cdr_date}")
 
     # Create schema once
     schema = create_schema()
@@ -432,18 +445,23 @@ def process_mnp_files(ldif_dir: str, cdr_date: str):
     """
     Process MNP files and insert directly into ClickHouse.
     This is called after UDC processing.
+    Only processes files matching cdr_date to avoid reprocessing old files.
     """
-    from processor_mnp import find_mnp_files, process_mnp_file, insert_to_clickhouse, extract_date_from_filename
+    from processor_mnp import find_mnp_files, process_mnp_file, insert_to_clickhouse_no_delete, delete_mnp_data_for_date, extract_date_from_filename
 
-    mnp_files = find_mnp_files(ldif_dir)
+    # Only find MNP files for today's date (not all files in folder)
+    mnp_files = find_mnp_files(ldif_dir, target_date=cdr_date)
     if not mnp_files:
-        logger.info("No MNP files found to process")
+        logger.info(f"No MNP files found for date {cdr_date}")
         return
 
     logger.info("=" * 60)
     logger.info("Processing MNP Files")
     logger.info("=" * 60)
-    logger.info(f"Found {len(mnp_files)} MNP files")
+    logger.info(f"Found {len(mnp_files)} MNP files for date {cdr_date}")
+
+    # Delete existing data for this date ONCE before processing
+    delete_mnp_data_for_date(cdr_date)
 
     total_records = 0
 
@@ -455,7 +473,8 @@ def process_mnp_files(ldif_dir: str, cdr_date: str):
 
         try:
             aggregated_data, detailed_records = process_mnp_file(str(mnp_file), file_date)
-            insert_to_clickhouse(aggregated_data, detailed_records, file_date)
+            # Use no-delete version since we already deleted above
+            insert_to_clickhouse_no_delete(aggregated_data, detailed_records, file_date)
             total_records += len(detailed_records)
             logger.info(f"    ✓ Processed {len(detailed_records):,} MNP records")
         except Exception as e:

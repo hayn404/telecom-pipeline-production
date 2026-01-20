@@ -351,6 +351,29 @@ production-deployment/
 
 ---
 
+## Important: Daily Data Processing Logic
+
+### UDC Files (Subscriber Data):
+- **Strategy:** REPLACE daily
+- Only processes files matching today's date (CDR_DATE)
+- Deletes old Parquet data for that date before inserting
+- Old files are deleted after processing (keeps only last 5 days)
+
+### MNP Files (Porting Data):
+- **Strategy:** ACCUMULATE (append new data)
+- Only processes files matching today's date (CDR_DATE)
+- Deletes MNP data for that date, then inserts new data
+- Old MNP records kept for 1 year
+- Old files deleted after 5 days
+
+### Why This Matters:
+- If CDR_DATE is set, only today's files are processed
+- This prevents reprocessing old files every day
+- MNP data accumulates over time (historical trends)
+- UDC data is replaced daily (always shows latest subscriber status)
+
+---
+
 ## Contact
 
 For questions about this system:
