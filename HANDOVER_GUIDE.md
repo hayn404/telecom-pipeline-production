@@ -1,8 +1,6 @@
 # Telecom Pipeline - Handover Guide
 
-## For: New Team Member (Non-Technical Background)
-
-**Developed by:** Haneen | Intern, CS Core Operations
+**Developed by:** Haneen Alaa| Data Science Intern, CS Core Operations
 **Supervised by:** Ahmed Mohamed Gamal | Voice Core Operations Manager
 
 ---
@@ -14,11 +12,9 @@ This project is an **automated system** that:
 2. **Processes and stores** the data in a database
 3. **Shows statistics** on a web dashboard
 
-Think of it like: **Excel on steroids** - it handles millions of records automatically and shows charts.
-
 ---
 
-## The Big Picture (Simple Explanation)
+## The Big Picture
 
 ```
 ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
@@ -72,7 +68,7 @@ Think of it like: **Excel on steroids** - it handles millions of records automat
 | **processor_lakehouse.py** | UDC_Details files | Converts to Parquet for dashboard |
 | **processor_mnp.py** | MNP files | Stores porting data in ClickHouse |
 
-**How it works (Simple):**
+**How it works:**
 
 ```
 UDC_Details_31_202511300627.ldif.gz
@@ -138,7 +134,7 @@ Dashboard asks: "How many VoLTE subscribers?"
 **What is it?**
 - A Python web application
 - Shows statistics, charts, and allows searching
-- Accessible via browser at `http://localhost:30014`
+- Accessible via browser at `http://10.74.192.12:30014`
 
 **Dashboard Tabs:**
 
@@ -226,7 +222,7 @@ docker-compose -f docker-compose-production.yml --profile processor up telecom_p
 
 ### Access Dashboard:
 
-Open browser: `http://localhost:30014`
+Open browser: `http://10.74.192.12:30014`
 - Username: `admin`
 - Password: `admin123`
 
@@ -289,7 +285,7 @@ production-deployment/
 
 | Service | Port | URL |
 |---------|------|-----|
-| Dashboard | 30014 | http://localhost:30014 |
+| Dashboard | 30014 | http://10.74.192.12:30014 |
 | ClickHouse HTTP | 30012 | - |
 | ClickHouse Native | 30013 | - |
 
@@ -335,7 +331,7 @@ production-deployment/
                               ▼
                   ┌───────────────────────┐
                   │   Streamlit Dashboard │
-                  │   (http://localhost:  │
+                  │   (http://10.74.192.12:│
                   │    30014)             │
                   └───────────────────────┘
                               │
@@ -374,11 +370,6 @@ production-deployment/
 
 ---
 
-## Contact
-
-For questions about this system:
-- **Developer:** Haneen | CS Core Operations Intern
-- **Supervisor:** Ahmed Mohamed Gamal | Voice Core Operations Manager
 
 ---
 
