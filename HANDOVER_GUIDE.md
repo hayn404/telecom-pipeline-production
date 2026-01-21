@@ -1,7 +1,7 @@
 # Telecom Pipeline - Handover Guide
 
-**Developed by:** Haneen Alaa| Data Science Intern, CS Core Operations
-**Supervised by:** Ahmed Mohamed Gamal | Voice Core Operations Manager
+- **Developed by:** Haneen Alaa| Data Science Intern, CS Core Operations
+- **Supervised by:** Ahmed Mohamed Gamal | Voice Core Operations Manager
 
 ---
 
