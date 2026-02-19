@@ -76,6 +76,11 @@ SELECT
     coalesce(EpsIndDefContextId, '') AS EpsIndDefContextId,
     coalesce(EpsProfileId, '') AS EpsProfileId,
     coalesce(EpsUserIpV4Address, '') AS EpsUserIpV4Address,
+    coalesce(CFUT10FNUM, '') AS CFUT10FNUM,
+    coalesce(CFBTS10FNUM, '') AS CFBTS10FNUM,
+    coalesce(CFNRCTS10FNUM, '') AS CFNRCTS10FNUM,
+    coalesce(CFNRYTS10FNUM, '') AS CFNRYTS10FNUM,
+    coalesce(DCFTS10FNUM, '') AS DCFTS10FNUM,
     coalesce(source_file, '') AS source_file,
     coalesce(processing_time, now()) AS processing_time
 FROM default.dump_source;

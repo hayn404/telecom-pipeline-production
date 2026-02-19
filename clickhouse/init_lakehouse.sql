@@ -60,6 +60,11 @@ SELECT
     CAST(EpsIndDefContextId AS Nullable(String)) AS EpsIndDefContextId,
     CAST(EpsProfileId AS Nullable(String)) AS EpsProfileId,
     CAST(EpsUserIpV4Address AS Nullable(String)) AS EpsUserIpV4Address,
+    CAST(CFUT10FNUM AS Nullable(String)) AS CFUT10FNUM,
+    CAST(CFBTS10FNUM AS Nullable(String)) AS CFBTS10FNUM,
+    CAST(CFNRCTS10FNUM AS Nullable(String)) AS CFNRCTS10FNUM,
+    CAST(CFNRYTS10FNUM AS Nullable(String)) AS CFNRYTS10FNUM,
+    CAST(DCFTS10FNUM AS Nullable(String)) AS DCFTS10FNUM,
     CAST(source_file AS Nullable(String)) AS source_file,
     CAST(processing_time AS Nullable(DateTime)) AS processing_time
 FROM file('/var/lib/clickhouse/user_files/parquet/telecom_data/**/*.parquet', 'Parquet')
@@ -120,6 +125,11 @@ CREATE TABLE IF NOT EXISTS default.dump_materialized
     EpsIndDefContextId String DEFAULT '',
     EpsProfileId String DEFAULT '',
     EpsUserIpV4Address String DEFAULT '',
+    CFUT10FNUM String DEFAULT '',
+    CFBTS10FNUM String DEFAULT '',
+    CFNRCTS10FNUM String DEFAULT '',
+    CFNRYTS10FNUM String DEFAULT '',
+    DCFTS10FNUM String DEFAULT '',
     source_file String DEFAULT '',
     processing_time DateTime DEFAULT now()
 )
@@ -207,6 +217,11 @@ SELECT
     coalesce(ImsBarrInd, '') AS ImsBarrInd,
     coalesce(COLP, '') AS COLP,
     coalesce(SOCOLP, '') AS SOCOLP,
+    coalesce(CFUT10FNUM, '') AS CFUT10FNUM,
+    coalesce(CFBTS10FNUM, '') AS CFBTS10FNUM,
+    coalesce(CFNRCTS10FNUM, '') AS CFNRCTS10FNUM,
+    coalesce(CFNRYTS10FNUM, '') AS CFNRYTS10FNUM,
+    coalesce(DCFTS10FNUM, '') AS DCFTS10FNUM,
     coalesce(source_file, '') AS source_file,
     coalesce(processing_time, now()) AS processing_time
 FROM default.dump_source;

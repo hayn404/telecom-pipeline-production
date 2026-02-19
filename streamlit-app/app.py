@@ -664,7 +664,12 @@ with tab2:
                         TS22,
                         DCF,
                         EpsAccessRestriction,
-                        CDRtime
+                        CDRtime,
+                        CFUT10FNUM,
+                        CFBTS10FNUM,
+                        CFNRCTS10FNUM,
+                        CFNRYTS10FNUM,
+                        DCFTS10FNUM
                     FROM default.dump
                     WHERE {search_field} = '{search_value}' AND CDRtime = '{cdr_date_str_dash}'
                     LIMIT 1
@@ -680,7 +685,8 @@ with tab2:
                     df_user = pd.DataFrame(result_rows, columns=[
                         'MSISDN', 'IMSI', 'TICK', 'PDPCP', 'EpsProfileId', 'EpsIndDefContextId',
                         'EpsStnSr', 'EpsUserIpV4Address', 'CFU', 'CFB', 'HOLD', 'CAW',
-                        'TS11', 'TS21', 'TS22', 'DCF', 'EpsAccessRestriction', 'CDRtime'
+                        'TS11', 'TS21', 'TS22', 'DCF', 'EpsAccessRestriction', 'CDRtime',
+                        'CFUT10FNUM', 'CFBTS10FNUM', 'CFNRCTS10FNUM', 'CFNRYTS10FNUM', 'DCFTS10FNUM'
                     ])
 
                     # Display main profile info
@@ -781,6 +787,31 @@ with tab2:
                         st.markdown(f"**HOLD:** {hold_status}")
                     with col4:
                         st.markdown(f"**CAW:** {caw_status}")
+
+                    st.markdown("---")
+
+                    # Call Forwarding Destinations
+                    st.subheader("📲 Call Forwarding Destinations")
+                    fwd_entries = [
+                        ("CFU (Unconditional)",   'CFUT10FNUM'),
+                        ("CFB (Busy)",            'CFBTS10FNUM'),
+                        ("CFNRC (No Reply)",      'CFNRCTS10FNUM'),
+                        ("CFNRY (No Reply 2)",    'CFNRYTS10FNUM'),
+                        ("DCF (Default)",         'DCFTS10FNUM'),
+                    ]
+                    any_fwd = False
+                    fwd_cols = st.columns(len(fwd_entries))
+                    for col_widget, (label, attr) in zip(fwd_cols, fwd_entries):
+                        fwd_num = df_user[attr].iloc[0]
+                        if fwd_num and str(fwd_num).strip() not in ('', 'None', 'nan'):
+                            col_widget.markdown(f"**{label}**")
+                            col_widget.markdown(f"`{fwd_num}`")
+                            any_fwd = True
+                        else:
+                            col_widget.markdown(f"**{label}**")
+                            col_widget.markdown("—")
+                    if not any_fwd:
+                        st.info("No call forwarding destinations configured for this subscriber.")
 
                     st.markdown("---")
 

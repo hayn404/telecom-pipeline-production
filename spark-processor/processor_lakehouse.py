@@ -13,6 +13,7 @@ Optimizations for large files (7+ GB compressed):
     - Garbage collection between chunks
 """
 
+import base64
 import os
 import gc
 import gzip
@@ -55,8 +56,63 @@ SELECTED_ATTRS = [
     # New parameters for VoLTE APN analysis
     'EpsIndDefContextId',  # VoLTE APN - if missing on VoLTE profile, indicates problem
     'EpsProfileId',        # Profile ID for subscriber
-    'EpsUserIpV4Address'   # Format: 2002200145$10.89.73.130 (last 3 digits before $ = APN, after $ = IP)
+    'EpsUserIpV4Address',  # Format: 2002200145$10.89.73.130 (last 3 digits before $ = APN, after $ = IP)
+    # Call forwarding destination numbers (base64-encoded MSISDN, decoded at processing time)
+    'CFUT10FNUM',    # Unconditional Call Forward (CFU) destination
+    'CFBTS10FNUM',   # Call Forward Busy (CFB) destination
+    'CFNRCTS10FNUM', # Call Forward No Reply (CFNRC) destination
+    'CFNRYTS10FNUM', # Call Forward No Reply 2 (CFNRY) destination
+    'DCFTS10FNUM',   # Default Call Forward (DCF) destination
 ]
+
+# Attributes that are base64-encoded MSISDNs and need special decoding
+FORWARDING_NUMBER_ATTRS = {
+    'CFUT10FNUM', 'CFBTS10FNUM', 'CFNRCTS10FNUM', 'CFNRYTS10FNUM', 'DCFTS10FNUM'
+}
+
+
+def decode_forwarding_number(raw_value: str) -> str:
+    """
+    Decode a base64-encoded MSISDN forwarding number stored in UDC LDIF attributes
+    such as CFUT10FNUM, CFBTS10FNUM, CFNRCTS10FNUM, CFNRYTS10FNUM, DCFTS10FNUM.
+
+    LDIF base64 values (marked with ::) are parsed by stream_ldif_entries as ': <base64>'.
+
+    Decoding algorithm:
+      1. Strip the leading ': ' prefix left by the LDIF double-colon notation
+      2. Base64-decode to raw bytes
+      3. Hex-encode the bytes (e.g. 29021111327478)
+      4. Drop the first byte (first 2 hex chars)
+      5. Swap every pair of hex digits to recover the MSISDN
+         e.g. 02 11 11 32 74 78 -> 20 11 11 23 47 87 -> 201111234787
+    """
+    try:
+        b64_str = raw_value.strip()
+        # Remove LDIF double-colon prefix stored as ': '
+        if b64_str.startswith(': '):
+            b64_str = b64_str[2:].strip()
+        elif b64_str.startswith(':'):
+            b64_str = b64_str[1:].strip()
+
+        if not b64_str:
+            return None
+
+        decoded_bytes = base64.b64decode(b64_str)
+        hex_str = decoded_bytes.hex()
+
+        # Drop first byte
+        hex_str = hex_str[2:]
+        if not hex_str:
+            return None
+
+        # Swap each pair of hex digits
+        result = ''
+        for i in range(0, len(hex_str) - 1, 2):
+            result += hex_str[i + 1] + hex_str[i]
+
+        return result if result else None
+    except Exception:
+        return None
 
 
 def create_spark_session() -> SparkSession:
@@ -204,8 +260,12 @@ def process_entries_chunk(entries: List[Dict], source_file: str, cdr_date: str) 
                     value = entry.get(attr, None)
                     if isinstance(value, list):
                         value = value[0] if value else None
-                    # Convert to string if value exists, otherwise None
-                    record[attr] = str(value) if value else None
+                    if value and attr in FORWARDING_NUMBER_ATTRS:
+                        # Decode base64-encoded MSISDN forwarding number
+                        record[attr] = decode_forwarding_number(str(value))
+                    else:
+                        # Convert to string if value exists, otherwise None
+                        record[attr] = str(value) if value else None
 
         # Only include records with valid MSISDN
         if record.get('MSISDN') is not None:
@@ -441,48 +501,95 @@ def process_ldif_files_to_parquet(spark: SparkSession, ldif_dir: str, parquet_di
     logger.info("=" * 60)
 
 
-def process_mnp_files(ldif_dir: str, cdr_date: str):
+def process_mnp_files(ldif_dir: str, cdr_date: str = None):
     """
-    Process MNP files and insert directly into ClickHouse.
-    This is called after UDC processing.
-    Only processes files matching cdr_date to avoid reprocessing old files.
-    """
-    from processor_mnp import find_mnp_files, process_mnp_file, insert_to_clickhouse_no_delete, delete_mnp_data_for_date, extract_date_from_filename
+    Process MNP files and insert into ClickHouse.
+    - Skips empty/corrupt files (< 100 bytes)
+    - Checks ClickHouse to avoid reprocessing dates that already have data
+    - Processes only missing dates (fills gaps automatically)
 
-    # Only find MNP files for today's date (not all files in folder)
-    mnp_files = find_mnp_files(ldif_dir, target_date=cdr_date)
-    if not mnp_files:
-        logger.info(f"No MNP files found for date {cdr_date}")
-        return
+    Note: File cleanup and retention are handled by daily_pipeline.sh
+    """
+    from processor_mnp import (
+        find_mnp_files, process_mnp_file, insert_to_clickhouse_no_delete,
+        delete_mnp_data_for_date, extract_date_from_filename,
+        get_processed_mnp_dates
+    )
+    from collections import defaultdict
 
     logger.info("=" * 60)
     logger.info("Processing MNP Files")
     logger.info("=" * 60)
-    logger.info(f"Found {len(mnp_files)} MNP files for date {cdr_date}")
 
-    # Delete existing data for this date ONCE before processing
-    delete_mnp_data_for_date(cdr_date)
+    # Get dates that already have data in ClickHouse
+    processed_dates = get_processed_mnp_dates()
 
+    # Find all MNP files in directory
+    all_mnp_files = find_mnp_files(ldif_dir)
+    if not all_mnp_files:
+        logger.info("No MNP files found")
+        return
+
+    logger.info(f"Found {len(all_mnp_files)} MNP files")
+
+    # Group valid files by date (skip empty/corrupt)
+    files_by_date = defaultdict(list)
+    skipped = 0
+
+    for mnp_file in all_mnp_files:
+        file_date = extract_date_from_filename(mnp_file.name)
+        file_size = mnp_file.stat().st_size
+
+        if not file_date:
+            skipped += 1
+            continue
+
+        if file_size < 100:
+            logger.warning(f"  Skipping {mnp_file.name} (empty: {file_size} bytes)")
+            skipped += 1
+            continue
+
+        files_by_date[file_date].append(mnp_file)
+
+    if skipped:
+        logger.info(f"Skipped {skipped} invalid/empty files")
+
+    # Find dates that need processing
+    dates_to_process = [d for d in sorted(files_by_date.keys()) if d not in processed_dates]
+    dates_skipped = [d for d in sorted(files_by_date.keys()) if d in processed_dates]
+
+    if dates_skipped:
+        logger.info(f"Already processed: {', '.join(dates_skipped)}")
+
+    if not dates_to_process:
+        logger.info("All MNP data is up to date")
+        return
+
+    logger.info(f"Processing {len(dates_to_process)} new dates: {', '.join(dates_to_process)}")
+
+    # Process each missing date
     total_records = 0
 
-    for idx, mnp_file in enumerate(mnp_files, 1):
-        file_name = mnp_file.name
-        file_date = extract_date_from_filename(file_name) or cdr_date
+    for date_key in dates_to_process:
+        date_files = files_by_date[date_key]
+        delete_mnp_data_for_date(date_key)  # Clear any partial data
 
-        logger.info(f"  MNP File {idx}/{len(mnp_files)}: {file_name} (Date: {file_date})")
-
-        try:
-            aggregated_data, detailed_records = process_mnp_file(str(mnp_file), file_date)
-            # Use no-delete version since we already deleted above
-            insert_to_clickhouse_no_delete(aggregated_data, detailed_records, file_date)
-            total_records += len(detailed_records)
-            logger.info(f"    ✓ Processed {len(detailed_records):,} MNP records")
-        except Exception as e:
-            logger.error(f"    ✗ Error processing {file_name}: {e}")
+        for mnp_file in date_files:
+            file_name = mnp_file.name
+            try:
+                aggregated_data, detailed_records = process_mnp_file(str(mnp_file), date_key)
+                if detailed_records:
+                    insert_to_clickhouse_no_delete(aggregated_data, detailed_records, date_key)
+                    total_records += len(detailed_records)
+                    logger.info(f"  ✓ {file_name}: {len(detailed_records):,} records")
+                else:
+                    logger.info(f"  - {file_name}: 0 records")
+            except Exception as e:
+                logger.error(f"  ✗ {file_name}: {e}")
 
         gc.collect()
 
-    logger.info(f"MNP Processing complete: {total_records:,} total records")
+    logger.info(f"MNP complete: {total_records:,} records")
 
 
 def main():

@@ -141,6 +141,13 @@ def process_mnp_file(file_path: str, cdr_date: str) -> tuple:
     Returns: (Dict[(prefix, value), count], List[detailed_records])
     """
     file_name = os.path.basename(file_path)
+
+    # Skip very small files (empty or corrupt)
+    file_size = os.path.getsize(file_path)
+    if file_size < 100:
+        logger.warning(f"Skipping {file_name} - file too small ({file_size} bytes)")
+        return {}, []
+
     logger.info(f"Processing MNP file: {file_name}")
 
     # Aggregate counts by (prefix, nprefix_value)
@@ -381,85 +388,149 @@ def delete_mnp_data_for_date(cdr_date: str):
         logger.error(f"Error deleting MNP data for {cdr_date}: {e}")
 
 
+def get_processed_mnp_dates() -> set:
+    """
+    Get dates that already have MNP data in ClickHouse.
+    Returns a set of date strings in 'YYYY-MM-DD' format.
+    Note: Retention/cleanup is handled by daily_pipeline.sh
+    """
+    try:
+        import clickhouse_connect
+
+        client = clickhouse_connect.get_client(
+            host=CLICKHOUSE_HOST,
+            port=CLICKHOUSE_PORT,
+            username='default',
+            password=''
+        )
+
+        result = client.query("""
+            SELECT DISTINCT toString(Date) as date_str
+            FROM default.MNP
+            ORDER BY date_str
+        """)
+
+        processed_dates = {row[0] for row in result.result_rows}
+        client.close()
+        logger.info(f"Found {len(processed_dates)} dates with existing MNP data")
+        return processed_dates
+
+    except Exception as e:
+        logger.error(f"Error querying processed dates: {e}")
+        return set()
+
+
+def get_mnp_record_count_for_date(cdr_date: str) -> int:
+    """Get count of MNP records for a specific date"""
+    try:
+        import clickhouse_connect
+
+        client = clickhouse_connect.get_client(
+            host=CLICKHOUSE_HOST,
+            port=CLICKHOUSE_PORT,
+            username='default',
+            password=''
+        )
+
+        result = client.query(f"SELECT COUNT(*) FROM default.MNP WHERE Date = '{cdr_date}'")
+        count = result.result_rows[0][0] if result.result_rows else 0
+        client.close()
+        return count
+
+    except Exception as e:
+        logger.error(f"Error querying record count for {cdr_date}: {e}")
+        return 0
+
+
 def main():
-    """Main entry point for MNP processing"""
+    """
+    Main entry point for MNP processing (standalone mode).
+    - Skips empty/corrupt files (< 100 bytes)
+    - Checks ClickHouse to avoid reprocessing dates
+    - Processes only missing dates (fills gaps automatically)
+
+    Note: Retention/cleanup is handled by daily_pipeline.sh
+    """
+    from collections import defaultdict
+
     logger.info("=" * 60)
-    logger.info("MNP LDIF Processor - Mobile Number Portability")
+    logger.info("MNP LDIF Processor")
     logger.info("=" * 60)
     logger.info(f"LDIF Directory: {LDIF_DIR}")
-    logger.info(f"Target CDR Date: {CDR_DATE}")
     logger.info(f"ClickHouse: {CLICKHOUSE_HOST}:{CLICKHOUSE_PORT}")
     logger.info("=" * 60)
 
-    # Find MNP files - if CDR_DATE is set, only process files for that date
-    # This prevents reprocessing old MNP files every day
-    mnp_files = find_mnp_files(LDIF_DIR, target_date=CDR_DATE)
+    # Get dates that already have data in ClickHouse
+    processed_dates = get_processed_mnp_dates()
 
-    if not mnp_files:
+    # Find all MNP files
+    all_mnp_files = find_mnp_files(LDIF_DIR)
+    if not all_mnp_files:
         logger.warning(f"No MNP files found in {LDIF_DIR}")
-        logger.info("Looking for files matching: MNP_*.ldif or MNP_*.ldif.gz")
         return
 
-    logger.info(f"Found {len(mnp_files)} MNP files to process for date {CDR_DATE}")
+    logger.info(f"Found {len(all_mnp_files)} MNP files")
 
-    # Group files by date and delete existing data ONCE per date (not per file)
-    files_by_date = {}
-    for mnp_file in mnp_files:
-        file_date = extract_date_from_filename(mnp_file.name) or CDR_DATE
-        if file_date not in files_by_date:
-            files_by_date[file_date] = []
+    # Group valid files by date (skip empty/corrupt)
+    files_by_date = defaultdict(list)
+    skipped = 0
+
+    for mnp_file in all_mnp_files:
+        file_date = extract_date_from_filename(mnp_file.name)
+        file_size = mnp_file.stat().st_size
+
+        if not file_date:
+            skipped += 1
+            continue
+
+        if file_size < 100:
+            logger.warning(f"  Skipping {mnp_file.name} (empty: {file_size} bytes)")
+            skipped += 1
+            continue
+
         files_by_date[file_date].append(mnp_file)
 
-    logger.info(f"Files grouped into {len(files_by_date)} unique dates")
+    if skipped:
+        logger.info(f"Skipped {skipped} invalid/empty files")
 
-    # Delete existing data for all dates BEFORE processing any files
-    for date_to_delete in files_by_date.keys():
-        delete_mnp_data_for_date(date_to_delete)
+    # Find dates that need processing
+    dates_to_process = [d for d in sorted(files_by_date.keys()) if d not in processed_dates]
+    dates_skipped = [d for d in sorted(files_by_date.keys()) if d in processed_dates]
 
-    # Process each MNP file
+    if dates_skipped:
+        logger.info(f"Already processed: {', '.join(dates_skipped)}")
+
+    if not dates_to_process:
+        logger.info("All MNP data is up to date")
+        return
+
+    logger.info(f"Processing {len(dates_to_process)} new dates: {', '.join(dates_to_process)}")
+
+    # Process each missing date
     total_records = 0
 
-    for idx, mnp_file in enumerate(mnp_files, 1):
-        file_name = mnp_file.name
-        file_size = mnp_file.stat().st_size / 1024  # KB
+    for date_key in dates_to_process:
+        date_files = files_by_date[date_key]
+        logger.info(f"Date {date_key}: {len(date_files)} files")
+        delete_mnp_data_for_date(date_key)  # Clear any partial data
 
-        # Extract date from filename or use default
-        file_date = extract_date_from_filename(file_name) or CDR_DATE
-
-        logger.info("-" * 60)
-        logger.info(f"FILE {idx}/{len(mnp_files)}: {file_name}")
-        logger.info(f"Size: {file_size:.2f} KB")
-        logger.info(f"Date: {file_date}")
-        logger.info("-" * 60)
-
-        file_start = datetime.now()
-
-        try:
-            # Process and aggregate
-            aggregated_data, detailed_records = process_mnp_file(str(mnp_file), file_date)
-
-            # Insert to ClickHouse (no longer deletes - already deleted above)
-            insert_to_clickhouse_no_delete(aggregated_data, detailed_records, file_date)
-
-            file_records = len(detailed_records)
-            total_records += file_records
-
-            file_duration = (datetime.now() - file_start).total_seconds()
-            logger.info(f"  Completed in {file_duration:.1f}s ({file_records:,} MNP records)")
-
-        except Exception as e:
-            logger.error(f"Error processing {file_name}: {e}")
-            import traceback
-            traceback.print_exc()
+        for mnp_file in date_files:
+            file_name = mnp_file.name
+            try:
+                aggregated_data, detailed_records = process_mnp_file(str(mnp_file), date_key)
+                if detailed_records:
+                    insert_to_clickhouse_no_delete(aggregated_data, detailed_records, date_key)
+                    total_records += len(detailed_records)
+                    logger.info(f"  ✓ {file_name}: {len(detailed_records):,} records")
+                else:
+                    logger.info(f"  - {file_name}: 0 records")
+            except Exception as e:
+                logger.error(f"  ✗ {file_name}: {e}")
 
         gc.collect()
 
-    # Final statistics
     logger.info("=" * 60)
-    logger.info("MNP PROCESSING COMPLETE")
-    logger.info("=" * 60)
-    logger.info(f"Total files processed: {len(mnp_files)}")
-    logger.info(f"Total MNP records: {total_records:,}")
+    logger.info(f"MNP complete: {total_records:,} records")
     logger.info("=" * 60)
 
 
