@@ -1,9 +1,14 @@
 # Telecom Pipeline - Handover Guide
 
+<<<<<<< HEAD
 ## For: New Team Member (Non-Technical Background)
 
 **Developed by:** Haneen | Intern, CS Core Operations
 **Supervised by:** Ahmed Mohamed Gamal | Voice Core Operations Manager
+=======
+- **Developed by:** Haneen Alaa| Data Science Intern, CS Core Operations
+- **Supervised by:** Ahmed Mohamed Gamal | Voice Core Operations Manager
+>>>>>>> b0781d29c06d1bd53291de84fc9d3e333d821318
 
 ---
 
@@ -14,11 +19,17 @@ This project is an **automated system** that:
 2. **Processes and stores** the data in a database
 3. **Shows statistics** on a web dashboard
 
+<<<<<<< HEAD
 Think of it like: **Excel on steroids** - it handles millions of records automatically and shows charts.
 
 ---
 
 ## The Big Picture (Simple Explanation)
+=======
+---
+
+## The Big Picture
+>>>>>>> b0781d29c06d1bd53291de84fc9d3e333d821318
 
 ```
 ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐         ┌─────────────────┐
@@ -72,7 +83,11 @@ Think of it like: **Excel on steroids** - it handles millions of records automat
 | **processor_lakehouse.py** | UDC_Details files | Converts to Parquet for dashboard |
 | **processor_mnp.py** | MNP files | Stores porting data in ClickHouse |
 
+<<<<<<< HEAD
 **How it works (Simple):**
+=======
+**How it works:**
+>>>>>>> b0781d29c06d1bd53291de84fc9d3e333d821318
 
 ```
 UDC_Details_31_202511300627.ldif.gz
@@ -138,7 +153,11 @@ Dashboard asks: "How many VoLTE subscribers?"
 **What is it?**
 - A Python web application
 - Shows statistics, charts, and allows searching
+<<<<<<< HEAD
 - Accessible via browser at `http://localhost:30014`
+=======
+- Accessible via browser at `http://10.74.192.12:30014`
+>>>>>>> b0781d29c06d1bd53291de84fc9d3e333d821318
 
 **Dashboard Tabs:**
 
@@ -226,7 +245,11 @@ docker-compose -f docker-compose-production.yml --profile processor up telecom_p
 
 ### Access Dashboard:
 
+<<<<<<< HEAD
 Open browser: `http://localhost:30014`
+=======
+Open browser: `http://10.74.192.12:30014`
+>>>>>>> b0781d29c06d1bd53291de84fc9d3e333d821318
 - Username: `admin`
 - Password: `admin123`
 
@@ -289,7 +312,11 @@ production-deployment/
 
 | Service | Port | URL |
 |---------|------|-----|
+<<<<<<< HEAD
 | Dashboard | 30014 | http://localhost:30014 |
+=======
+| Dashboard | 30014 | http://10.74.192.12:30014 |
+>>>>>>> b0781d29c06d1bd53291de84fc9d3e333d821318
 | ClickHouse HTTP | 30012 | - |
 | ClickHouse Native | 30013 | - |
 
@@ -335,7 +362,11 @@ production-deployment/
                               ▼
                   ┌───────────────────────┐
                   │   Streamlit Dashboard │
+<<<<<<< HEAD
                   │   (http://localhost:  │
+=======
+                  │   (http://10.74.192.12:│
+>>>>>>> b0781d29c06d1bd53291de84fc9d3e333d821318
                   │    30014)             │
                   └───────────────────────┘
                               │
@@ -374,11 +405,14 @@ production-deployment/
 
 ---
 
+<<<<<<< HEAD
 ## Contact
 
 For questions about this system:
 - **Developer:** Haneen | CS Core Operations Intern
 - **Supervisor:** Ahmed Mohamed Gamal | Voice Core Operations Manager
+=======
+>>>>>>> b0781d29c06d1bd53291de84fc9d3e333d821318
 
 ---
 
