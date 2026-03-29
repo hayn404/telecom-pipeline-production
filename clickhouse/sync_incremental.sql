@@ -29,6 +29,16 @@ WHERE CDRtime IN (SELECT DISTINCT CDRtime FROM default.dump_source);
 
 -- Step 3: Sync all data from Parquet (handles both new and replaced dates)
 INSERT INTO default.dump_materialized
+    (mscid, CDRtime, MSISDN, IMSI, CSP, CSLOC, VLRADD, PDPCP, TICK,
+     OBO, OBI, OBR, TS11, TS21, TS22, PRBT, NAM, DCF, CAW, HOLD,
+     CFB, CFNRC, CFNRY, CFU, CLIR, SOCLIR, SOCLIP, CLIP, CAT,
+     EpsImeiSv, EpsLastUpdateLocationDate, EpsLastActivityDate,
+     EpsAccessRestriction, EpsStnSr, EpsAutomaticProvisioned,
+     EpsRoamAllow, EpsRoamRestrict, EpsRoamingServiceAreaId,
+     ImsLastActivityDate, ImsRoamAllow, ImsBarrInd, COLP, SOCOLP,
+     EpsIndDefContextId, EpsIndMappingContextId, EpsProfileId,
+     EpsUserIpV4Address, IMPI, source_file, processing_time,
+     CFUT10FNUM, CFBTS10FNUM, CFNRCTS10FNUM, CFNRYTS10FNUM, DCFTS10FNUM)
 SELECT
     coalesce(mscid, '') AS mscid,
     CDRtime,
@@ -74,15 +84,17 @@ SELECT
     coalesce(COLP, '') AS COLP,
     coalesce(SOCOLP, '') AS SOCOLP,
     coalesce(EpsIndDefContextId, '') AS EpsIndDefContextId,
+    coalesce(EpsIndMappingContextId, '') AS EpsIndMappingContextId,
     coalesce(EpsProfileId, '') AS EpsProfileId,
     coalesce(EpsUserIpV4Address, '') AS EpsUserIpV4Address,
+    coalesce(IMPI, '') AS IMPI,
+    coalesce(source_file, '') AS source_file,
+    coalesce(processing_time, now()) AS processing_time,
     coalesce(CFUT10FNUM, '') AS CFUT10FNUM,
     coalesce(CFBTS10FNUM, '') AS CFBTS10FNUM,
     coalesce(CFNRCTS10FNUM, '') AS CFNRCTS10FNUM,
     coalesce(CFNRYTS10FNUM, '') AS CFNRYTS10FNUM,
-    coalesce(DCFTS10FNUM, '') AS DCFTS10FNUM,
-    coalesce(source_file, '') AS source_file,
-    coalesce(processing_time, now()) AS processing_time
+    coalesce(DCFTS10FNUM, '') AS DCFTS10FNUM
 FROM default.dump_source;
 
 -- Step 4: Optimize the table (merge parts and rebuild indexes)

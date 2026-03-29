@@ -58,8 +58,10 @@ SELECT
     CAST(COLP AS Nullable(String)) AS COLP,
     CAST(SOCOLP AS Nullable(String)) AS SOCOLP,
     CAST(EpsIndDefContextId AS Nullable(String)) AS EpsIndDefContextId,
+    CAST(EpsIndMappingContextId AS Nullable(String)) AS EpsIndMappingContextId,
     CAST(EpsProfileId AS Nullable(String)) AS EpsProfileId,
     CAST(EpsUserIpV4Address AS Nullable(String)) AS EpsUserIpV4Address,
+    CAST(IMPI AS Nullable(String)) AS IMPI,
     CAST(CFUT10FNUM AS Nullable(String)) AS CFUT10FNUM,
     CAST(CFBTS10FNUM AS Nullable(String)) AS CFBTS10FNUM,
     CAST(CFNRCTS10FNUM AS Nullable(String)) AS CFNRCTS10FNUM,
@@ -69,7 +71,9 @@ SELECT
     CAST(processing_time AS Nullable(DateTime)) AS processing_time
 FROM file('/var/lib/clickhouse/user_files/parquet/telecom_data/**/*.parquet', 'Parquet')
 WHERE _path NOT LIKE '%_temporary%'
-SETTINGS input_format_parquet_import_nested = 1;
+SETTINGS
+    input_format_parquet_import_nested = 1,
+    input_format_parquet_allow_missing_columns = 1;
 
 -- ============================================================================
 -- STEP 2: MATERIALIZED TABLE - Fast indexed table for queries
@@ -123,8 +127,10 @@ CREATE TABLE IF NOT EXISTS default.dump_materialized
     COLP String DEFAULT '',
     SOCOLP String DEFAULT '',
     EpsIndDefContextId String DEFAULT '',
+    EpsIndMappingContextId String DEFAULT '',
     EpsProfileId String DEFAULT '',
     EpsUserIpV4Address String DEFAULT '',
+    IMPI String DEFAULT '',
     CFUT10FNUM String DEFAULT '',
     CFBTS10FNUM String DEFAULT '',
     CFNRCTS10FNUM String DEFAULT '',
