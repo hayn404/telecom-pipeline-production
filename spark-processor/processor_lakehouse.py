@@ -55,8 +55,10 @@ SELECTED_ATTRS = [
     'COLP', 'SOCOLP',
     # New parameters for VoLTE APN analysis
     'EpsIndDefContextId',  # VoLTE APN - if missing on VoLTE profile, indicates problem
+    'EpsIndMappingContextId',  # VoLTE mapping context - healthy value: 15$2008300586
     'EpsProfileId',        # Profile ID for subscriber
     'EpsUserIpV4Address',  # Format: 2002200145$10.89.73.130 (last 3 digits before $ = APN, after $ = IP)
+    'IMPI',                # IMS Private Identity - required for healthy VoLTE user
     # Call forwarding destination numbers (base64-encoded MSISDN, decoded at processing time)
     'CFUT10FNUM',    # Unconditional Call Forward (CFU) destination
     'CFBTS10FNUM',   # Call Forward Busy (CFB) destination
@@ -211,6 +213,9 @@ def stream_ldif_entries(file_path: str) -> Generator[Dict[str, Any], None, None]
                     value = parts[1].strip() if len(parts) > 1 else ''
 
                     if attr not in current_entry:
+                        current_entry[attr] = value
+                    elif attr == 'EpsIndMappingContextId' and value in ('15$2008300586', '15$1008300586'):
+                        # Healthy APN can appear in any position — prefer it over non-healthy values
                         current_entry[attr] = value
 
             # Last entry
