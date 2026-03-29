@@ -48,44 +48,47 @@ if not st.session_state.authenticated:
 # Title
 st.title("📡 e& CS Core Operations Dashboard")
 
-# Connect to ClickHouse - Create new connection for each query to avoid concurrency issues
-def get_clickhouse_client():
+# Connect to ClickHouse - pooled connection via st.cache_resource
+@st.cache_resource
+def get_clickhouse_pool():
+    """Create a reusable ClickHouse client (connection pool)"""
     try:
         client = clickhouse_connect.get_client(
             host=os.getenv('CLICKHOUSE_HOST', 'telecom_clickhouse'),
             port=int(os.getenv('CLICKHOUSE_PORT', '8123')),
             username='default',
-            password=''
+            password='',
+            compress=True,
+            query_retries=2,
+            connect_timeout=10,
+            send_receive_timeout=30,
         )
         return client
     except Exception as e:
         st.error(f"Failed to connect to ClickHouse: {e}")
         return None
 
+def get_clickhouse_client():
+    return get_clickhouse_pool()
+
 def run_query(query):
-    """Execute a query with a fresh connection to avoid concurrency issues"""
-    client = get_clickhouse_client()
+    """Execute a query using the pooled connection"""
+    client = get_clickhouse_pool()
     if client is None:
         raise Exception("Cannot connect to database")
-    try:
-        result = client.query(query)
-        return result
-    finally:
-        client.close()
+    result = client.query(query)
+    return result
 
 # Cached query function - caches results for 5 minutes to speed up dashboard
 @st.cache_data(ttl=300, show_spinner=False)
 def run_cached_query(query):
     """Execute a query with caching (5 min TTL) for better performance"""
-    client = get_clickhouse_client()
+    client = get_clickhouse_pool()
     if client is None:
         raise Exception("Cannot connect to database")
-    try:
-        result = client.query(query)
-        # Convert to tuple of tuples for caching (lists aren't hashable)
-        return tuple(tuple(row) for row in result.result_rows), result.column_names
-    finally:
-        client.close()
+    result = client.query(query)
+    # Convert to tuple of tuples for caching (lists aren't hashable)
+    return tuple(tuple(row) for row in result.result_rows), result.column_names
 
 def get_cached_result(query):
     """Wrapper to get cached query results"""
@@ -96,15 +99,12 @@ def get_cached_result(query):
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_user_lookup_cached(query):
     """Execute a user lookup query with caching (1 hour TTL) for fast repeated lookups"""
-    client = get_clickhouse_client()
+    client = get_clickhouse_pool()
     if client is None:
         raise Exception("Cannot connect to database")
-    try:
-        result = client.query(query)
-        # Convert to tuple of tuples for caching (lists aren't hashable)
-        return tuple(tuple(row) for row in result.result_rows), result.column_names
-    finally:
-        client.close()
+    result = client.query(query)
+    # Convert to tuple of tuples for caching (lists aren't hashable)
+    return tuple(tuple(row) for row in result.result_rows), result.column_names
 
 def get_user_lookup_result(query):
     """Wrapper to get cached user lookup query results"""
@@ -113,11 +113,10 @@ def get_user_lookup_result(query):
 
 # Test connection (quick check)
 try:
-    test_client = get_clickhouse_client()
+    test_client = get_clickhouse_pool()
     if test_client is None:
         st.error("Cannot connect to database. Please check ClickHouse service.")
         st.stop()
-    test_client.close()
 except Exception as e:
     st.error(f"Database connection failed: {e}")
     st.stop()
@@ -125,16 +124,18 @@ except Exception as e:
 # Sidebar - Date Selection
 st.sidebar.title("⚙️ Settings")
 
-# Get all available UDC dates from the database (dates extracted from filenames)
+# Get all available UDC dates with counts in a single query
 try:
-    rows, _ = run_cached_query("SELECT DISTINCT CDRtime FROM default.dump ORDER BY CDRtime DESC")
+    rows, _ = run_cached_query("SELECT CDRtime, count() AS cnt FROM default.dump GROUP BY CDRtime ORDER BY CDRtime DESC")
     available_udc_dates = []
+    date_counts = {}
     for row in rows:
         if row[0]:
             d = row[0]
             if isinstance(d, str):
                 d = datetime.strptime(d, '%Y-%m-%d').date()
             available_udc_dates.append(d)
+            date_counts[d] = row[1]
 
     if available_udc_dates:
         default_date = available_udc_dates[0]  # Latest available date
@@ -144,6 +145,7 @@ try:
 except:
     default_date = date.today()
     available_udc_dates = [default_date]
+    date_counts = {}
 
 # Show info about available data dates
 st.sidebar.info(f"📅 UDC data available for {len(available_udc_dates)} date(s)")
@@ -168,24 +170,19 @@ cdr_date_str_dash = cdr_date.strftime('%Y-%m-%d')
 # Add refresh button in sidebar
 if st.sidebar.button("🔄 Refresh Data"):
     st.cache_data.clear()
+    st.cache_resource.clear()
     st.rerun()
 
-# Verify data exists for selected date
-try:
-    rows, _ = run_cached_query(f"SELECT COUNT(*) as count FROM default.dump WHERE CDRtime = '{cdr_date_str_dash}'")
-    date_count = rows[0][0]
-
-    if date_count == 0:
-        st.warning(f"⚠️ No data available for {cdr_date_str}. Please select a different date from the sidebar.")
-        st.stop()
-    else:
-        st.sidebar.success(f"✓ {date_count:,} records for {cdr_date_str}")
-except Exception as e:
-    st.error(f"Error checking data: {e}")
+# Verify data exists for selected date (use pre-fetched counts)
+date_count = date_counts.get(cdr_date, 0)
+if date_count == 0:
+    st.warning(f"⚠️ No data available for {cdr_date_str}. Please select a different date from the sidebar.")
     st.stop()
+else:
+    st.sidebar.success(f"✓ {date_count:,} records for {cdr_date_str}")
 
 # Create tabs
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Statistics", "🔍 User Lookup", "🔎 Advanced Search & Filter", "📱 MNP Analysis"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Statistics", "🔍 User Lookup", "🔎 Advanced Search & Filter", "📱 MNP Analysis", "🗂️ Reconciliation"])
 
 # ==================== TAB 1: STATISTICS ====================
 with tab1:
@@ -194,53 +191,37 @@ with tab1:
     # ==================== VOICE STATISTICS SECTION ====================
     st.subheader("📞 Voice Statistics")
 
+    # COMBINED QUERY: All voice metrics in a single scan
+    voice_metrics_query = f"""
+        SELECT
+            uniqExact(MSISDN) AS total_subs,
+            uniqExactIf(MSISDN, TICK = '215') AS volte_subs,
+            uniqExactIf(MSISDN, EpsAccessRestriction = '0') AS vowifi_subs,
+            uniqExactIf(MSISDN, length(EpsProfileId) >= 3 AND (EpsProfileId LIKE '3%' OR EpsProfileId LIKE '5%') AND EpsProfileId = PDPCP) AS fiveg_subs,
+            uniqExactIf(MSISDN, VLRADD != '' AND VLRADD IS NOT NULL AND NOT startsWith(VLRADD, '1920117900')) AS roaming_subs,
+            uniqExactIf(MSISDN, VLRADD != '' AND VLRADD IS NOT NULL AND startsWith(VLRADD, '1920117900')) AS local_subs,
+            uniqExactIf(MSISDN, (VLRADD IS NULL OR VLRADD = '') AND (TICK IS NULL OR TICK = '') AND (PDPCP IS NULL OR PDPCP = '') AND length(MSISDN) >= 9 AND length(MSISDN) <= 11 AND MSISDN LIKE '%611%') AS fvno_subs
+        FROM default.dump
+        WHERE CDRtime = '{cdr_date_str_dash}'
+    """
+    rows, _ = run_cached_query(voice_metrics_query)
+    total_subs, volte_subs, vowifi_subs, fiveg_subs, roaming_subs, local_subs, fvno_subs = rows[0]
+
     # Main metrics
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as count
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-        """
-        rows, _ = run_cached_query(query)
-        total_subs = rows[0][0]
         st.metric("Total Subscribers", f"{total_subs:,}")
 
     with col2:
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as count
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}' AND TICK = '215'
-        """
-        rows, _ = run_cached_query(query)
-        volte_subs = rows[0][0]
         volte_pct = (volte_subs / total_subs * 100) if total_subs > 0 else 0
         st.metric("VoLTE Subscribers", f"{volte_subs:,}", f"{volte_pct:.1f}%", delta_color="normal")
 
     with col3:
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as count
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}' AND EpsAccessRestriction = '0'
-        """
-        rows, _ = run_cached_query(query)
-        vowifi_subs = rows[0][0]
         vowifi_pct = (vowifi_subs / total_subs * 100) if total_subs > 0 else 0
         st.metric("VoWiFi Subscribers", f"{vowifi_subs:,}", f"{vowifi_pct:.1f}%", delta_color="normal")
 
     with col4:
-        # 5G: EpsProfileId is 3+ digits starting with 3 or 5, AND EpsProfileId = PDPCP
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as count
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-              AND length(EpsProfileId) >= 3
-              AND (EpsProfileId LIKE '3%' OR EpsProfileId LIKE '5%')
-              AND EpsProfileId = PDPCP
-        """
-        rows, _ = run_cached_query(query)
-        fiveg_subs = rows[0][0]
         fiveg_pct = (fiveg_subs / total_subs * 100) if total_subs > 0 else 0
         st.metric("5G Subscribers", f"{fiveg_subs:,}", f"{fiveg_pct:.1f}%", delta_color="normal")
 
@@ -264,7 +245,7 @@ with tab1:
                     WHEN (PDPCP = '' OR PDPCP IS NULL) AND TICK = '242' THEN 'PreActive Dial'
                     ELSE NULL
                 END as service_type,
-                COUNT(DISTINCT MSISDN) as subscribers
+                uniqExact(MSISDN) as subscribers
             FROM default.dump
             WHERE CDRtime = '{cdr_date_str_dash}'
               AND TICK IS NOT NULL AND TICK != ''
@@ -309,7 +290,7 @@ with tab1:
                     WHEN TICK IN ('190', '201', '203', '205') AND (EpsProfileId != '' AND EpsProfileId IS NOT NULL) THEN '4G'
                     ELSE NULL
                 END as network_type,
-                COUNT(DISTINCT MSISDN) as subscribers
+                uniqExact(MSISDN) as subscribers
             FROM default.dump
             WHERE CDRtime = '{cdr_date_str_dash}'
             GROUP BY network_type
@@ -351,7 +332,7 @@ with tab1:
                     WHEN EpsAccessRestriction = '63' THEN 'All Data Barred'
                     ELSE NULL
                 END as status,
-                COUNT(DISTINCT MSISDN) as subscribers
+                uniqExact(MSISDN) as subscribers
             FROM default.dump
             WHERE CDRtime = '{cdr_date_str_dash}'
               AND EpsAccessRestriction IS NOT NULL
@@ -384,14 +365,14 @@ with tab1:
         st.subheader("Call Features Adoption")
         query = f"""
             SELECT
-                COUNT(DISTINCT CASE WHEN CFU = '1' THEN MSISDN END) as cfu_enabled,
-                COUNT(DISTINCT CASE WHEN CFB = '1' THEN MSISDN END) as cfb_enabled,
-                COUNT(DISTINCT CASE WHEN HOLD = '1' THEN MSISDN END) as hold_enabled,
-                COUNT(DISTINCT CASE WHEN CAW = '1' THEN MSISDN END) as caw_enabled,
-                COUNT(DISTINCT CASE WHEN DCF = '1' THEN MSISDN END) as mcn_enabled,
-                COUNT(DISTINCT CASE WHEN CLIR = '1' THEN MSISDN END) as clir_enabled,
-                COUNT(DISTINCT CASE WHEN COLP = '1' THEN MSISDN END) as colp_enabled,
-                COUNT(DISTINCT MSISDN) as total
+                uniqExactIf(MSISDN, CFU = '1') as cfu_enabled,
+                uniqExactIf(MSISDN, CFB = '1') as cfb_enabled,
+                uniqExactIf(MSISDN, HOLD = '1') as hold_enabled,
+                uniqExactIf(MSISDN, CAW = '1') as caw_enabled,
+                uniqExactIf(MSISDN, DCF = '1') as mcn_enabled,
+                uniqExactIf(MSISDN, CLIR = '1') as clir_enabled,
+                uniqExactIf(MSISDN, COLP = '1') as colp_enabled,
+                uniqExact(MSISDN) as total
             FROM default.dump
             WHERE CDRtime = '{cdr_date_str_dash}'
         """
@@ -429,48 +410,14 @@ with tab1:
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as roaming
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-              AND VLRADD IS NOT NULL
-              AND VLRADD != ''
-              AND NOT startsWith(VLRADD, '1920117900')
-        """
-        rows, _ = run_cached_query(query)
-        roaming_subs = rows[0][0]
         roaming_pct = (roaming_subs / total_subs * 100) if total_subs > 0 else 0
         st.metric("Roaming Subscribers", f"{roaming_subs:,}", f"{roaming_pct:.1f}%", delta_color="normal")
 
     with col2:
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as local
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-              AND VLRADD IS NOT NULL
-              AND VLRADD != ''
-              AND startsWith(VLRADD, '1920117900')
-        """
-        rows, _ = run_cached_query(query)
-        local_subs = rows[0][0]
         local_pct = (local_subs / total_subs * 100) if total_subs > 0 else 0
         st.metric("Egypt/Local", f"{local_subs:,}", f"{local_pct:.1f}%", delta_color="normal")
 
     with col3:
-        # Fixed FVNO: no VLR, no TICK, no PDPCP, MSISDN length 9-11 digits, contains '611'
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as fvno
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-              AND (VLRADD IS NULL OR VLRADD = '')
-              AND (TICK IS NULL OR TICK = '')
-              AND (PDPCP IS NULL OR PDPCP = '')
-              AND length(MSISDN) >= 9
-              AND length(MSISDN) <= 11
-              AND MSISDN LIKE '%611%'
-        """
-        rows, _ = run_cached_query(query)
-        fvno_subs = rows[0][0]
         fvno_pct = (fvno_subs / total_subs * 100) if total_subs > 0 else 0
         st.metric("Fixed FVNO", f"{fvno_subs:,}", f"{fvno_pct:.1f}%", delta_color="normal")
 
@@ -480,83 +427,56 @@ with tab1:
     st.subheader("📶 Data SIMs Statistics")
     st.markdown("*Data SIMs: Subscribers with PDPCP or EpsUserIpV4Address (APN) but without TICK (no voice service)*")
 
+    # COMBINED QUERY: All Data SIMs metrics in a single scan
+    eps_5g_list = ['5115', '503', '554', '524', '585', '536', '530', '535', '511', '533', '537', '531', '540', '578', '579', '580', '592', '593', '594', '595', '557', '5111', '5113']
+    eps_5g_str = "', '".join(eps_5g_list)
+    data_sims_query = f"""
+        SELECT
+            uniqExactIf(MSISDN,
+                (TICK IS NULL OR TICK = '')
+                AND ((PDPCP IS NOT NULL AND PDPCP != '') OR (EpsIndDefContextId IS NOT NULL AND EpsIndDefContextId != ''))
+            ) AS data_sims_total,
+            uniqExactIf(MSISDN,
+                (TICK IS NULL OR TICK = '')
+                AND ((PDPCP IS NOT NULL AND PDPCP != '') OR (EpsIndDefContextId IS NOT NULL AND EpsIndDefContextId != ''))
+                AND (EpsProfileId IS NULL OR EpsProfileId = '')
+            ) AS data_2g3g,
+            uniqExactIf(MSISDN,
+                (TICK IS NULL OR TICK = '')
+                AND ((PDPCP IS NOT NULL AND PDPCP != '') OR (EpsIndDefContextId IS NOT NULL AND EpsIndDefContextId != ''))
+                AND EpsProfileId IN ('{eps_5g_str}')
+            ) AS data_5g,
+            uniqExactIf(MSISDN,
+                EpsIndDefContextId IS NOT NULL AND EpsIndDefContextId != ''
+                AND NOT endsWith(EpsIndDefContextId, '37') AND NOT endsWith(EpsIndDefContextId, '00')
+            ) AS corporate_data
+        FROM default.dump
+        WHERE CDRtime = '{cdr_date_str_dash}'
+    """
+    rows, _ = run_cached_query(data_sims_query)
+    data_sims_total, data_2g3g, data_5g, corporate_data = rows[0]
+    data_4g = max(0, data_sims_total - data_2g3g - data_5g)
+
     # Data SIMs metrics
     col1, col2, col3, col4, col5 = st.columns(5)
 
     with col1:
-        # Total Data SIMs: has PDPCP OR has EpsIndDefContextId, AND no TICK
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as count
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-              AND (TICK IS NULL OR TICK = '')
-              AND (
-                (PDPCP IS NOT NULL AND PDPCP != '')
-                OR (EpsIndDefContextId IS NOT NULL AND EpsIndDefContextId != '')
-              )
-        """
-        rows, _ = run_cached_query(query)
-        data_sims_total = rows[0][0]
         data_pct = (data_sims_total / total_subs * 100) if total_subs > 0 else 0
         st.metric("Total Data SIMs", f"{data_sims_total:,}", f"{data_pct:.1f}%", delta_color="normal")
 
     with col2:
-        # 2G/3G Data SIMs: EpsProfileId is NULL or empty
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as count
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-              AND (TICK IS NULL OR TICK = '')
-              AND (
-                (PDPCP IS NOT NULL AND PDPCP != '')
-                OR (EpsIndDefContextId IS NOT NULL AND EpsIndDefContextId != '')
-              )
-              AND (EpsProfileId IS NULL OR EpsProfileId = '')
-        """
-        rows, _ = run_cached_query(query)
-        data_2g3g = rows[0][0]
         data_2g3g_pct = (data_2g3g / data_sims_total * 100) if data_sims_total > 0 else 0
         st.metric("2G/3G Data SIMs", f"{data_2g3g:,}", f"{data_2g3g_pct:.1f}%", delta_color="normal")
 
     with col3:
-        # 5G Data SIMs
-        eps_5g_list = ['5115', '503', '554', '524', '585', '536', '530', '535', '511', '533', '537', '531', '540', '578', '579', '580', '592', '593', '594', '595', '557', '5111', '5113']
-        eps_5g_str = "', '".join(eps_5g_list)
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as count
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-              AND (TICK IS NULL OR TICK = '')
-              AND (
-                (PDPCP IS NOT NULL AND PDPCP != '')
-                OR (EpsIndDefContextId IS NOT NULL AND EpsIndDefContextId != '')
-              )
-              AND EpsProfileId IN ('{eps_5g_str}')
-        """
-        rows, _ = run_cached_query(query)
-        data_5g = rows[0][0]
         data_5g_pct = (data_5g / data_sims_total * 100) if data_sims_total > 0 else 0
         st.metric("5G Data SIMs", f"{data_5g:,}", f"{data_5g_pct:.1f}%", delta_color="normal")
 
     with col4:
-        # 4G Data SIMs = Total - 2G/3G - 5G
-        data_4g = max(0, data_sims_total - data_2g3g - data_5g)
         data_4g_pct = (data_4g / data_sims_total * 100) if data_sims_total > 0 else 0
         st.metric("4G Data SIMs", f"{data_4g:,}", f"{data_4g_pct:.1f}%", delta_color="normal")
 
     with col5:
-        # Corporate Data Dial: has EpsIndDefContextId and doesn't end with 37 or 00
-        query = f"""
-            SELECT COUNT(DISTINCT MSISDN) as count
-            FROM default.dump
-            WHERE CDRtime = '{cdr_date_str_dash}'
-              AND EpsIndDefContextId IS NOT NULL
-              AND EpsIndDefContextId != ''
-              AND NOT endsWith(EpsIndDefContextId, '37')
-              AND NOT endsWith(EpsIndDefContextId, '00')
-        """
-        rows, _ = run_cached_query(query)
-        corporate_data = rows[0][0]
         corporate_pct = (corporate_data / total_subs * 100) if total_subs > 0 else 0
         st.metric("Corporate Data Dial", f"{corporate_data:,}", f"{corporate_pct:.1f}%", delta_color="normal")
 
@@ -595,7 +515,7 @@ with tab1:
                     WHEN EpsProfileId IS NULL OR EpsProfileId = '' THEN '2G/3G'
                     ELSE EpsProfileId
                 END as EpsProfileId,
-                COUNT(DISTINCT MSISDN) as subscribers
+                uniqExact(MSISDN) as subscribers
             FROM default.dump
             WHERE CDRtime = '{cdr_date_str_dash}'
               AND (TICK IS NULL OR TICK = '')
@@ -1907,6 +1827,352 @@ with tab4:
 
             except Exception as e:
                 st.error(f"Error loading MNP trends: {e}")
+
+# ==================== TAB 5: RECONCILIATION ====================
+with tab5:
+    st.header("🗂️ VoLTE Health Reconciliation")
+    st.markdown(
+        "VoLTE subscriber health check. A **healthy VoLTE user** must have: "
+        "**TICK = 215**, **EpsProfileId set**, **EpsIndMappingContextId = 15$2008300586 or 15$1008300586**, "
+        "**IMPI set**, and be **present in all 3 IPW nodes** with **consistent NAPTR patterns**."
+    )
+    # ---- Load unified summary via LEFT JOIN of UDC (TICK=215) with IPW ----
+    volte_available = False
+    total_volte = 0
+    cnt_healthy = cnt_no_profile = cnt_wrong_apn = cnt_missing_impi = 0
+    cnt_not_in_ipw = cnt_ipw_missing_node = cnt_ipw_mismatch = 0
+
+    try:
+        vh_rows, _ = run_cached_query(f"""
+            SELECT
+                count()  AS total_volte,
+                countIf(
+                    d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+                    AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+                    AND d.IMPI != ''
+                    AND ipw.status = 'OK'
+                )  AS healthy,
+                countIf(d.EpsProfileId = '' OR d.EpsProfileId IS NULL)  AS no_profile,
+                countIf(
+                    d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+                    AND d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586')
+                )  AS wrong_apn,
+                countIf(
+                    d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+                    AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+                    AND (d.IMPI = '' OR d.IMPI IS NULL)
+                )  AS missing_impi,
+                countIf(ipw.msisdn IS NULL OR ipw.msisdn = '')  AS not_in_ipw,
+                countIf(ipw.status = 'MISSING')                 AS ipw_missing_node,
+                countIf(ipw.status = 'PATTERN_MISMATCH')        AS ipw_mismatch
+            FROM default.dump AS d
+            LEFT JOIN default.ipw_reconciliation AS ipw ON d.MSISDN = ipw.msisdn
+            WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
+        """)
+        if vh_rows and vh_rows[0][0] > 0:
+            volte_available      = True
+            total_volte          = int(vh_rows[0][0])
+            cnt_healthy          = int(vh_rows[0][1])
+            cnt_no_profile       = int(vh_rows[0][2])
+            cnt_wrong_apn        = int(vh_rows[0][3])
+            cnt_missing_impi     = int(vh_rows[0][4])
+            cnt_not_in_ipw       = int(vh_rows[0][5])
+            cnt_ipw_missing_node = int(vh_rows[0][6])
+            cnt_ipw_mismatch     = int(vh_rows[0][7])
+    except Exception as e:
+        st.error(f"Error loading VoLTE health data: {e}")
+
+    if not volte_available:
+        st.warning(f"No VoLTE subscribers (TICK=215) found for {cdr_date_str}.")
+    else:
+        # Users with no EpsProfileId aren't VoLTE users — exclude from healthy/unhealthy counts
+        cnt_with_profile = total_volte - cnt_no_profile
+        cnt_unhealthy = cnt_with_profile - cnt_healthy
+
+        # ---- Summary metrics ----
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Total TICK=215", f"{total_volte:,}",
+                       help="All subscribers with TICK=215 in UDC")
+        with col2:
+            st.metric("With EPS Profile", f"{cnt_with_profile:,}",
+                       help="Have EpsProfileId — actual VoLTE users")
+        with col3:
+            h_pct = (cnt_healthy / cnt_with_profile * 100) if cnt_with_profile > 0 else 0
+            st.metric("Healthy", f"{cnt_healthy:,}", f"{h_pct:.1f}%", delta_color="normal")
+        with col4:
+            u_pct = (cnt_unhealthy / cnt_with_profile * 100) if cnt_with_profile > 0 else 0
+            st.metric("Unhealthy", f"{cnt_unhealthy:,}", f"{u_pct:.1f}%", delta_color="inverse")
+
+        # Issue breakdown with clear descriptions
+        st.markdown("**Issue Breakdown:**")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("No EPS Profile", f"{cnt_no_profile:,}",
+                       help="TICK=215 but EpsProfileId is empty — not actual VoLTE users (not counted as unhealthy)")
+        with col2:
+            st.metric("Wrong APN Mapping", f"{cnt_wrong_apn:,}",
+                       help="Has EpsProfileId but EpsIndMappingContextId is not 15$2008300586 or 15$1008300586")
+        with col3:
+            st.metric("No IMS Identity", f"{cnt_missing_impi:,}",
+                       help="Has correct profile + APN but IMPI is empty (no IMS Private Identity)")
+        with col4:
+            st.metric("Not in IPW Files", f"{cnt_not_in_ipw:,}",
+                       help="Has TICK=215 in UDC but not found in any of the 3 IPW files")
+        with col5:
+            st.metric("IPW Node Issues", f"{cnt_ipw_missing_node + cnt_ipw_mismatch:,}",
+                       help="Missing from some IPW node(s) or NAPTR pattern mismatch across nodes")
+
+        st.markdown("---")
+
+        # ---- Charts ----
+        col_c1, col_c2 = st.columns(2)
+
+        with col_c1:
+            issue_data = []
+            if cnt_healthy > 0:
+                issue_data.append({'Issue': 'Healthy', 'Count': cnt_healthy})
+            if cnt_no_profile > 0:
+                issue_data.append({'Issue': 'No EPS Profile', 'Count': cnt_no_profile})
+            if cnt_wrong_apn > 0:
+                issue_data.append({'Issue': 'Wrong APN Mapping', 'Count': cnt_wrong_apn})
+            if cnt_missing_impi > 0:
+                issue_data.append({'Issue': 'No IMS Identity (IMPI)', 'Count': cnt_missing_impi})
+            if cnt_not_in_ipw > 0:
+                issue_data.append({'Issue': 'Not in IPW Files', 'Count': cnt_not_in_ipw})
+            if cnt_ipw_missing_node > 0:
+                issue_data.append({'Issue': 'Missing from IPW Node(s)', 'Count': cnt_ipw_missing_node})
+            if cnt_ipw_mismatch > 0:
+                issue_data.append({'Issue': 'NAPTR Pattern Mismatch', 'Count': cnt_ipw_mismatch})
+
+            if issue_data:
+                df_health = pd.DataFrame(issue_data)
+                fig_h = px.pie(
+                    df_health, values='Count', names='Issue',
+                    color='Issue',
+                    color_discrete_map={
+                        'Healthy': '#2ecc71',
+                        'No EPS Profile': '#95a5a6',
+                        'Wrong APN Mapping': '#e74c3c',
+                        'No IMS Identity (IMPI)': '#f39c12',
+                        'Not in IPW Files': '#e67e22',
+                        'Missing from IPW Node(s)': '#3498db',
+                        'NAPTR Pattern Mismatch': '#c0392b',
+                    }
+                )
+                fig_h.update_traces(textposition='inside', textinfo='percent+label')
+                fig_h.update_layout(showlegend=False, title="VoLTE Health Distribution")
+                st.plotly_chart(fig_h, use_container_width=True)
+
+        with col_c2:
+            if cnt_wrong_apn > 0:
+                try:
+                    eps_rows, _ = run_cached_query(f"""
+                        SELECT EpsIndMappingContextId, count() AS cnt
+                        FROM default.dump
+                        WHERE CDRtime = '{cdr_date_str_dash}' AND TICK = '215'
+                            AND EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586')
+                        GROUP BY EpsIndMappingContextId
+                        ORDER BY cnt DESC
+                        LIMIT 10
+                    """)
+                    if eps_rows:
+                        df_eps = pd.DataFrame(eps_rows, columns=['EpsIndMappingContextId', 'Count'])
+                        fig_eps = px.bar(
+                            df_eps, x='Count', y='EpsIndMappingContextId', orientation='h',
+                            title='Wrong EpsIndMappingContextId Values',
+                            text='Count', color_discrete_sequence=['#e74c3c']
+                        )
+                        fig_eps.update_traces(texttemplate='%{text:,}', textposition='outside')
+                        fig_eps.update_layout(yaxis={'categoryorder': 'total ascending'})
+                        st.plotly_chart(fig_eps, use_container_width=True)
+                except Exception as e:
+                    st.error(f"Error loading EpsIndMappingContextId breakdown: {e}")
+
+        st.markdown("---")
+
+        # ---- MSISDN Quick Lookup ----
+        st.subheader("MSISDN Quick Lookup")
+        lookup_msisdn = st.text_input(
+            "Enter MSISDN to check its full VoLTE health:",
+            placeholder="e.g. 201117539668",
+            key="ipw_lookup"
+        )
+        if lookup_msisdn:
+            lookup_msisdn = lookup_msisdn.strip()
+
+            # UDC profile
+            try:
+                udc_rows, _ = run_cached_query(f"""
+                    SELECT MSISDN, IMSI, TICK, EpsIndMappingContextId, IMPI, EpsProfileId
+                    FROM default.dump
+                    WHERE MSISDN = '{lookup_msisdn}' AND CDRtime = '{cdr_date_str_dash}'
+                    LIMIT 1
+                """)
+                if udc_rows:
+                    r = udc_rows[0]
+                    st.markdown("**UDC Profile:**")
+                    c1, c2, c3, c4 = st.columns(4)
+                    has_profile = bool(r[5])
+                    eps_ok = r[3] in ('15$2008300586', '15$1008300586')
+                    c1.metric("EpsProfileId", r[5] if r[5] else "EMPTY", "OK" if has_profile else "No Profile", delta_color="normal" if has_profile else "inverse")
+                    c2.metric("EpsIndMappingContextId", r[3] if r[3] else "EMPTY", "OK" if eps_ok else "Wrong APN", delta_color="normal" if eps_ok else "inverse")
+                    c3.metric("IMPI", r[4][:30] + "..." if r[4] and len(r[4]) > 30 else (r[4] if r[4] else "EMPTY"), "OK" if r[4] else "Missing", delta_color="normal" if r[4] else "inverse")
+                    c4.metric("TICK", r[2], "VoLTE" if r[2] == '215' else "Not VoLTE", delta_color="normal" if r[2] == '215' else "inverse")
+                else:
+                    st.info(f"MSISDN `{lookup_msisdn}` not found in UDC dump for {cdr_date_str}.")
+            except Exception as e:
+                st.error(f"UDC lookup error: {e}")
+
+            # IPW presence
+            try:
+                lk_rows, _ = run_cached_query(f"""
+                    SELECT
+                        msisdn, process_date,
+                        if(in_pipw,  'Present', 'Missing') AS PIPW,
+                        if(in_r1ipw, 'Present', 'Missing') AS R1IPW,
+                        if(in_yipw,  'Present', 'Missing') AS YIPW,
+                        status, pipw_pattern, r1ipw_pattern, yipw_pattern
+                    FROM default.ipw_reconciliation
+                    WHERE msisdn = '{lookup_msisdn}'
+                    LIMIT 1
+                """)
+                if lk_rows:
+                    r = lk_rows[0]
+                    status_val = r[5]
+                    st.markdown(f"**IPW Status:** `{status_val}`")
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("PIPW",  r[2])
+                    c2.metric("R1IPW", r[3])
+                    c3.metric("YIPW",  r[4])
+                    if status_val == 'PATTERN_MISMATCH':
+                        st.markdown("**NAPTR Patterns across nodes:**")
+                        st.write(pd.DataFrame({
+                            'Node':    ['PIPW',  'R1IPW',  'YIPW'],
+                            'Pattern': [r[6],    r[7],     r[8]]
+                        }))
+                else:
+                    st.warning(f"MSISDN `{lookup_msisdn}` **not found in any IPW file**.")
+            except Exception as e:
+                st.error(f"IPW lookup error: {e}")
+
+        st.markdown("---")
+
+        # ---- Unhealthy VoLTE Subscribers Table ----
+        st.subheader("Misconfigured VoLTE Subscribers")
+        st.markdown("All VoLTE users failing **any** health criterion (UDC profile or IPW presence).")
+
+        if cnt_unhealthy == 0:
+            st.success("All VoLTE subscribers are fully healthy.")
+        else:
+            # Issue type filter
+            issue_filter = st.selectbox("Filter by issue type:", [
+                "All Issues",
+                "No EPS Profile (EpsProfileId is empty)",
+                "Wrong APN Mapping (has profile but wrong EpsIndMappingContextId)",
+                "No IMS Identity (has profile + correct APN but IMPI empty)",
+                "Not in Any IPW File (TICK=215 but absent from IPW)",
+                "Missing from Some IPW Node(s)",
+                "NAPTR Pattern Mismatch Across IPW Nodes",
+            ], key="recon_filter")
+
+            # Build WHERE clause based on filter
+            issue_where = ""
+            if "No EPS Profile" in issue_filter:
+                issue_where = "AND (d.EpsProfileId = '' OR d.EpsProfileId IS NULL)"
+            elif "Wrong APN Mapping" in issue_filter:
+                issue_where = "AND d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL AND d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586')"
+            elif "No IMS Identity" in issue_filter:
+                issue_where = "AND d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586') AND (d.IMPI = '' OR d.IMPI IS NULL)"
+            elif "Not in Any IPW" in issue_filter:
+                issue_where = "AND (ipw.msisdn IS NULL OR ipw.msisdn = '')"
+            elif "Missing from Some IPW" in issue_filter:
+                issue_where = "AND ipw.status = 'MISSING'"
+            elif "NAPTR Pattern Mismatch" in issue_filter:
+                issue_where = "AND ipw.status = 'PATTERN_MISMATCH'"
+
+            # For "All Issues" exclude healthy users AND no-profile users (they aren't VoLTE)
+            if issue_filter == "All Issues":
+                issue_where = """AND d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+                AND NOT (
+                    d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+                    AND d.IMPI != ''
+                    AND ipw.status = 'OK'
+                )"""
+
+            try:
+                misc_rows, _ = run_cached_query(f"""
+                    SELECT
+                        d.MSISDN,
+                        d.IMSI,
+                        d.EpsProfileId,
+                        d.EpsIndMappingContextId,
+                        d.IMPI,
+                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                            if(ipw.in_pipw, 'Y', 'N')) AS PIPW,
+                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                            if(ipw.in_r1ipw, 'Y', 'N')) AS R1IPW,
+                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                            if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
+                        multiIf(
+                            ipw.msisdn IS NULL OR ipw.msisdn = '', 'Not in IPW',
+                            ipw.status = 'MISSING', 'Missing from Node(s)',
+                            ipw.status = 'PATTERN_MISMATCH', 'NAPTR Mismatch',
+                            'OK'
+                        ) AS ipw_status
+                    FROM default.dump AS d
+                    LEFT JOIN default.ipw_reconciliation AS ipw ON d.MSISDN = ipw.msisdn
+                    WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
+                        {issue_where}
+                    ORDER BY d.MSISDN
+                    LIMIT 1000
+                """)
+                if misc_rows:
+                    df_misc = pd.DataFrame(misc_rows, columns=[
+                        'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
+                        'PIPW', 'R1IPW', 'YIPW', 'IPW Status'
+                    ])
+                    st.caption(f"Showing first {len(df_misc):,} results")
+                    st.dataframe(df_misc, use_container_width=True, height=400)
+                else:
+                    st.info("No subscribers found for this filter.")
+
+                # Download
+                dl_rows, _ = run_cached_query(f"""
+                    SELECT
+                        d.MSISDN, d.IMSI, d.EpsProfileId, d.EpsIndMappingContextId, d.IMPI,
+                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                            if(ipw.in_pipw, 'Y', 'N')) AS PIPW,
+                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                            if(ipw.in_r1ipw, 'Y', 'N')) AS R1IPW,
+                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                            if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
+                        multiIf(
+                            ipw.msisdn IS NULL OR ipw.msisdn = '', 'Not in IPW',
+                            ipw.status = 'MISSING', 'Missing from Node(s)',
+                            ipw.status = 'PATTERN_MISMATCH', 'NAPTR Mismatch',
+                            'OK'
+                        ) AS ipw_status
+                    FROM default.dump AS d
+                    LEFT JOIN default.ipw_reconciliation AS ipw ON d.MSISDN = ipw.msisdn
+                    WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
+                        {issue_where}
+                    ORDER BY d.MSISDN
+                    LIMIT 100000
+                """)
+                if dl_rows:
+                    df_dl = pd.DataFrame(dl_rows, columns=[
+                        'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
+                        'PIPW', 'R1IPW', 'YIPW', 'IPW Status'
+                    ])
+                    st.download_button(
+                        label="Download Misconfigured VoLTE Users (CSV)",
+                        data=df_dl.to_csv(index=False),
+                        file_name=f"volte_unhealthy_{cdr_date_str}.csv",
+                        mime='text/csv'
+                    )
+            except Exception as e:
+                st.error(f"Error loading misconfigured subscribers: {e}")
 
 # Footer
 st.markdown("---")
