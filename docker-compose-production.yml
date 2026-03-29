@@ -70,6 +70,9 @@ services:
     volumes:
       - ./wldif:/wldif:ro
       - ./data/parquet:/data/parquet
+      - ./spark-processor/processor_lakehouse.py:/app/processor_lakehouse.py:ro  # Override baked-in processor with updated version
+      - ./spark-processor/processor_ipw.py:/app/processor_ipw.py:ro             # IPW audit processor (no rebuild needed)
+      - ./ipw_audit:/ipw_audit:ro                                                # Raw IPW files downloaded from FTP
     networks:
       - telecom-prod-network
     depends_on:
