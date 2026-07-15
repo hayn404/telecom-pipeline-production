@@ -82,7 +82,7 @@ echo "Step 1: Initializing Database Tables"
 echo "============================================"
 if [ -f "clickhouse/init_lakehouse.sql" ]; then
     echo "Creating tables (MNP, dump_materialized, etc.)..."
-    docker exec -i telecom-prod-clickhouse clickhouse-client --multiquery < clickhouse/init_lakehouse.sql 2>&1 | head -5 || true
+    sudo docker exec -i telecom-prod-clickhouse clickhouse-client --multiquery < clickhouse/init_lakehouse.sql 2>&1 | head -5 || true
     echo "Tables ready!"
 else
     echo "Warning: init_lakehouse.sql not found!"
@@ -93,7 +93,7 @@ echo ""
 echo "============================================"
 echo "Step 2: Running Spark Processor"
 echo "============================================"
-docker-compose -f docker-compose-production.yml --profile processor run --rm telecom_prod_spark_processor
+sudo docker compose -f docker-compose-production.yml --profile processor run --rm telecom_prod_spark_processor
 
 echo ""
 echo "============================================"
@@ -110,7 +110,7 @@ echo "============================================"
 if [ -f "clickhouse/sync_incremental.sql" ]; then
     echo ""
     echo "Syncing data from Parquet to optimized MergeTree table..."
-    docker exec -i telecom-prod-clickhouse clickhouse-client --multiquery < clickhouse/sync_incremental.sql 2>&1 | grep -E "(status|metric|Sync completed|rows|final_status)" || true
+    sudo docker exec -i telecom-prod-clickhouse clickhouse-client --multiquery < clickhouse/sync_incremental.sql 2>&1 | grep -E "(status|metric|Sync completed|rows|final_status)" || true
     echo "Sync complete!"
 else
     echo "Sync SQL not found - data available via Parquet VIEW"
@@ -169,7 +169,7 @@ echo ""
 echo "============================================"
 echo "MNP Data Statistics"
 echo "============================================"
-docker exec telecom-prod-clickhouse clickhouse-client --query "
+sudo docker exec telecom-prod-clickhouse clickhouse-client --query "
 SELECT
     'Total MNP Records' as Metric,
     toString(COUNT(*)) as Value
@@ -210,7 +210,7 @@ echo "Available Data Dates"
 echo "============================================"
 echo ""
 echo "UDC Data Dates:"
-docker exec telecom-prod-clickhouse clickhouse-client --query "
+sudo docker exec telecom-prod-clickhouse clickhouse-client --query "
 SELECT CDRtime as Date, COUNT(*) as Records
 FROM default.dump
 GROUP BY CDRtime
@@ -220,7 +220,7 @@ LIMIT 10
 
 echo ""
 echo "MNP Data Dates:"
-docker exec telecom-prod-clickhouse clickhouse-client --query "
+sudo docker exec telecom-prod-clickhouse clickhouse-client --query "
 SELECT Date, COUNT(*) as Records
 FROM default.MNP_details
 GROUP BY Date

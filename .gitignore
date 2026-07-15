@@ -2,6 +2,7 @@
 data/
 dump/
 wldif/
+ipw_audit/
 
 # Docker images (large tar files)
 docker-images/*.tar

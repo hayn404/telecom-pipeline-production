@@ -280,13 +280,20 @@ def process_entries_chunk(entries: List[Dict], source_file: str, cdr_date: str) 
 
 
 def chunk_iterator(iterator: Iterator, chunk_size: int) -> Generator[List, None, None]:
-    """Split an iterator into chunks of specified size"""
+    """
+    Split an iterator into chunks of specified size, but only cut at mscId
+    boundaries. This ensures all LDIF blocks for one subscriber stay in the
+    same chunk and get merged together, instead of being split across chunks.
+    """
     chunk = []
+    current_mscid = None
     for item in iterator:
-        chunk.append(item)
-        if len(chunk) >= chunk_size:
+        item_mscid = extract_mscid(item.get('dn', ''))
+        if len(chunk) >= chunk_size and item_mscid != current_mscid:
             yield chunk
             chunk = []
+        chunk.append(item)
+        current_mscid = item_mscid
     if chunk:
         yield chunk
 

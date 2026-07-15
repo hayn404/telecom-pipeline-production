@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Telecom Pipeline - Production Lakehouse Architecture
 # Offline deployment configuration
 
@@ -11,6 +9,10 @@ networks:
 volumes:
   telecom-prod-clickhouse-data:
     name: telecom-prod-clickhouse-data
+  streamlit-cache:
+    name: telecom-prod-streamlit-cache
+  pcgt-data:
+    name: telecom-prod-pcgt-data
 
 services:
   # ClickHouse Database - Production
@@ -102,9 +104,14 @@ services:
     environment:
       CLICKHOUSE_HOST: telecom_prod_clickhouse
       CLICKHOUSE_PORT: 8123
+      CACHE_DIR: /app/cache
     volumes:
       - ./data/parquet:/data/parquet:ro
       - ./streamlit-app/app.py:/app/app.py:ro  # Live reload - changes reflect immediately
+      - ./streamlit-app/pcgt_audit.py:/app/pcgt_audit.py:ro  # Live reload
+      - ./streamlit-app/cnacld_tab.py:/app/cnacld_tab.py:ro
+      - streamlit-cache:/app/cache  # Persistent server-side cache for pre-computed results
+      - pcgt-data:/app/data/pcgt    # Persistent PC/GT audit data shared across users
     networks:
       - telecom-prod-network
     depends_on:

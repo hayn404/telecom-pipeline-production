@@ -60,48 +60,24 @@ log_step() {
 }
 
 log_success() {
-    echo -e "${GREEN}✓ $1${NC}" | tee -a "${LOG_FILE}"
+    echo -e "${GREEN}? $1${NC}" | tee -a "${LOG_FILE}"
 }
 
 log_warning() {
-    echo -e "${YELLOW}⚠ $1${NC}" | tee -a "${LOG_FILE}"
+    echo -e "${YELLOW}? $1${NC}" | tee -a "${LOG_FILE}"
 }
 
 log_error() {
-    echo -e "${RED}✗ ERROR: $1${NC}" | tee -a "${LOG_FILE}" >&2
+    echo -e "${RED}? ERROR: $1${NC}" | tee -a "${LOG_FILE}" >&2
 }
 
-#-------------------------------------------------------------------------------
-# STEP 1: CHECK PREREQUISITES
-#-------------------------------------------------------------------------------
-check_prerequisites() {
-    log_step "STEP 1: Checking Prerequisites"
-
-    if ! command -v docker &> /dev/null; then
-        log_error "Docker is not installed!"
-        exit 1
-    fi
-    log_success "Docker is available"
-
-    if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
-        log_error "Docker Compose is not installed!"
-        exit 1
-    fi
-    log_success "Docker Compose is available"
-
-    if ! command -v sshpass &> /dev/null; then
-        log_error "sshpass is not installed!"
-        exit 1
-    fi
-    log_success "sshpass is available"
-}
 
 #-------------------------------------------------------------------------------
 # STEP 2: CREATE DIRECTORIES
 #-------------------------------------------------------------------------------
 create_directories() {
     log_step "STEP 2: Creating Directories"
-    mkdir -p "${LDIF_DIR}" "${PARQUET_DIR}" "${LOG_DIR}"
+    sudo mkdir -p "${LDIF_DIR}" "${PARQUET_DIR}" "${LOG_DIR}"
     log_success "Directories ready"
 }
 
@@ -132,7 +108,7 @@ clean_old_udc() {
             done
             if [ "$keep" = false ]; then
                 log "  Removing: $filename"
-                rm -f "$f"
+                sudo rm -f "$f"
             fi
         fi
     done
@@ -159,16 +135,16 @@ clean_old_udc() {
 
                     if [ "$partition_date" -lt "$CUTOFF_DATE" ]; then
                         log "  Removing old partition: $day_dir"
-                        rm -rf "$day_dir"
+                        sudo rm -rf "$day_dir"
                     fi
                 done
 
                 # Remove empty month dir
-                rmdir "$month_dir" 2>/dev/null || true
+                sudo rmdir "$month_dir" 2>/dev/null || true
             done
 
             # Remove empty year dir
-            rmdir "$year_dir" 2>/dev/null || true
+            sudo rmdir "$year_dir" 2>/dev/null || true
         done
     fi
 
@@ -214,15 +190,15 @@ start_services() {
     cd "${PROJECT_DIR}"
 
     # Start ClickHouse
-    if ! docker ps | grep -q "${CLICKHOUSE_CONTAINER}"; then
+    if ! sudo docker ps | grep -q "${CLICKHOUSE_CONTAINER}"; then
         log "Starting ClickHouse..."
-        docker-compose -f "${DOCKER_COMPOSE_FILE}" up -d telecom_prod_clickhouse
+        sudo docker compose -f "${DOCKER_COMPOSE_FILE}" up -d telecom_prod_clickhouse
     fi
 
     # Wait for ClickHouse
     log "Waiting for ClickHouse..."
     for i in {1..30}; do
-        if docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query "SELECT 1" &>/dev/null; then
+        if sudo docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query "SELECT 1" &>/dev/null; then
             log_success "ClickHouse ready"
             break
         fi
@@ -230,9 +206,9 @@ start_services() {
     done
 
     # Start Streamlit
-    if ! docker ps | grep -q "telecom-prod-streamlit-app"; then
+    if ! sudo docker ps | grep -q "telecom-prod-streamlit-app"; then
         log "Starting Streamlit..."
-        docker-compose -f "${DOCKER_COMPOSE_FILE}" up -d telecom_prod_streamlit_app
+        sudo docker compose -f "${DOCKER_COMPOSE_FILE}" up -d telecom_prod_streamlit_app
     fi
     log_success "Services running"
 }
@@ -252,7 +228,7 @@ run_processor() {
 
     # Run processor
     log "Processing date: ${TODAY_DASH}"
-    CDR_DATE="${TODAY_DASH}" docker-compose -f "${DOCKER_COMPOSE_FILE}" \
+    CDR_DATE="${TODAY_DASH}" sudo docker compose -f "${DOCKER_COMPOSE_FILE}" \
         --profile processor run --rm telecom_prod_spark_processor \
         2>&1 | tee -a "${LOG_FILE}"
 
@@ -267,7 +243,7 @@ sync_udc_data() {
 
     # Delete old UDC data from ClickHouse (keep last 7 days)
     log "Deleting UDC data older than ${UDC_RETENTION_DAYS} days from ClickHouse..."
-    docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
+    sudo docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
         ALTER TABLE default.dump_materialized DELETE WHERE CDRtime < today() - ${UDC_RETENTION_DAYS}
     " 2>&1 | tee -a "${LOG_FILE}" || true
 
@@ -275,7 +251,7 @@ sync_udc_data() {
     sleep 5
 
     log "Running sync_incremental.sql..."
-    docker exec -i ${CLICKHOUSE_CONTAINER} clickhouse-client --multiquery \
+    sudo docker exec -i ${CLICKHOUSE_CONTAINER} clickhouse-client --multiquery \
         < "${PROJECT_DIR}/clickhouse/sync_incremental.sql" \
         2>&1 | tee -a "${LOG_FILE}"
 
@@ -283,18 +259,33 @@ sync_udc_data() {
 }
 
 #-------------------------------------------------------------------------------
-# STEP 8: CLEANUP OLD MNP DATA (Keep 30 days)
+# STEP 8: GENERATE EXCEL REPORTS (Last 15 days)
+#-------------------------------------------------------------------------------
+generate_excel_reports() {
+    log_step "STEP 8: Generating Excel Reports"
+
+    sudo mkdir -p "${PROJECT_DIR}/reports"
+
+    sudo docker exec telecom-prod-streamlit-app python /app/generate_report.py \
+        2>&1 | tee -a "${LOG_FILE}" \
+        || log_warning "Excel report generation failed (non-fatal — pipeline continues)"
+
+    log_success "Excel reports saved to ${PROJECT_DIR}/reports/"
+}
+
+#-------------------------------------------------------------------------------
+# STEP 9: CLEANUP OLD MNP DATA (Keep 30 days)
 #-------------------------------------------------------------------------------
 cleanup_old_mnp() {
-    log_step "STEP 8: Cleanup Old MNP Data (Keep ${MNP_RETENTION_DAYS} days)"
+    log_step "STEP 9: Cleanup Old MNP Data (Keep ${MNP_RETENTION_DAYS} days)"
 
     # Delete MNP data older than 30 days from ClickHouse
     log "Deleting MNP data older than ${MNP_RETENTION_DAYS} days..."
-    docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
+    sudo docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
         ALTER TABLE default.MNP DELETE WHERE Date < today() - ${MNP_RETENTION_DAYS}
     " 2>&1 | tee -a "${LOG_FILE}" || true
 
-    docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
+    sudo docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
         ALTER TABLE default.MNP_details DELETE WHERE Date < today() - ${MNP_RETENTION_DAYS}
     " 2>&1 | tee -a "${LOG_FILE}" || true
 
@@ -309,25 +300,25 @@ cleanup_old_mnp() {
 }
 
 #-------------------------------------------------------------------------------
-# STEP 9: VERIFY & STATUS
+# STEP 10: VERIFY & STATUS
 #-------------------------------------------------------------------------------
 show_status() {
-    log_step "STEP 9: Status"
+    log_step "STEP 10: Status"
 
     log "UDC Records for ${TODAY_DASH}:"
-    docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
+    sudo docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
         SELECT COUNT(*) as records, COUNT(DISTINCT MSISDN) as subscribers
         FROM default.dump WHERE CDRtime = '${TODAY_DASH}'
     " 2>/dev/null || echo "  (no data)"
 
     log "MNP Records (last 30 days):"
-    docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
+    sudo docker exec ${CLICKHOUSE_CONTAINER} clickhouse-client --query="
         SELECT COUNT(*) as total, COUNT(DISTINCT Date) as days
         FROM default.MNP WHERE Date >= today() - 30
     " 2>/dev/null || echo "  (no data)"
 
     log "Services:"
-    docker ps --format "table {{.Names}}\t{{.Status}}" | grep "telecom-prod" || echo "  (none)"
+    sudo docker ps --format "table {{.Names}}\t{{.Status}}" | grep "telecom-prod" || echo "  (none)"
 }
 
 #-------------------------------------------------------------------------------
@@ -341,14 +332,14 @@ main() {
 
     START_TIME=$(date +%s)
 
-    check_prerequisites
     create_directories
-    clean_old_udc        # Delete all old UDC first
-    download_files       # Then download today's files
+    clean_old_udc           # Delete all old UDC first
+    download_files          # Then download today's files
     start_services
     run_processor
-    sync_udc_data        # Sync Parquet to ClickHouse
-    cleanup_old_mnp      # Clean old MNP (keep 30 days)
+    sync_udc_data           # Sync Parquet to ClickHouse
+    generate_excel_reports  # Export daily Excel reports to /reports/
+    cleanup_old_mnp         # Clean old MNP (keep 30 days)
     show_status
 
     END_TIME=$(date +%s)

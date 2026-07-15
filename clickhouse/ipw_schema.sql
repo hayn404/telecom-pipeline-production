@@ -1,13 +1,13 @@
 -- ============================================================================
 -- IPW Audit Schema
--- VoLTE MSISDN reconciliation across PIPW, R1IPW, YIPW IMS nodes
+-- VoLTE MSISDN reconciliation across PIPW, RIPW, YIPW IMS nodes
 --
 -- USAGE (run once to initialise):
 --   docker exec telecom-prod-clickhouse clickhouse-client --multiquery < ipw_schema.sql
 --
 -- TABLES / VIEWS:
 --   1. ipw_source        — VIEW reading fresh Parquet files (same pattern as dump_source)
---   2. ipw_raw           — MergeTree table: one row per MSISDN per source file
+--   2. ipw_raw           — ReplacingMergeTree table: one row per MSISDN per source file per date
 --   3. ipw_reconciliation — VIEW: one row per MSISDN, status per process_date
 --   4. ipw_summary        — VIEW: aggregated counts per process_date
 -- ============================================================================
@@ -35,8 +35,10 @@ SETTINGS
 
 -- ============================================================================
 -- 2. RAW TABLE — one row per (MSISDN, source_file, process_date)
---    Populated by ipw_sync.sql (TRUNCATE + INSERT weekly)
+--    Changed from MergeTree to ReplacingMergeTree to handle duplicate inserts
+--    Populated by ipw_sync.sql (INSERT weekly, no TRUNCATE)
 --    Partitioned by month for efficient management
+--    Retention: 7 days (old partitions deleted by pipeline script)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS default.ipw_raw
 (
@@ -45,7 +47,7 @@ CREATE TABLE IF NOT EXISTS default.ipw_raw
     naptrTxt     String,
     source_file  LowCardinality(String)   -- 'PIPW', 'R1IPW', 'YIPW'
 )
-ENGINE = MergeTree()
+ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(process_date)
 ORDER BY (process_date, source_file, msisdn)
 SETTINGS index_granularity = 8192;
@@ -59,6 +61,7 @@ ALTER TABLE default.ipw_raw
 --    One row per (msisdn, process_date).
 --    Uses conditional aggregation (countIf / maxIf) — no FULL OUTER JOIN needed.
 --    ClickHouse evaluates this in a single GROUP BY pass over ipw_raw.
+--    FINAL keyword ensures deduplication when querying ReplacingMergeTree.
 --
 --    status values:
 --      'OK'               — present in all 3 files with identical naptrTxt
@@ -72,12 +75,12 @@ SELECT
 
     -- Pattern seen in each file (empty string if absent)
     maxIf(naptrTxt, source_file = 'PIPW')   AS pipw_pattern,
-    maxIf(naptrTxt, source_file = 'R1IPW')  AS r1ipw_pattern,
+    maxIf(naptrTxt, source_file = 'RIPW')  AS ripw_pattern,
     maxIf(naptrTxt, source_file = 'YIPW')   AS yipw_pattern,
 
     -- Presence flags (1 = present, 0 = absent)
     countIf(source_file = 'PIPW')  > 0      AS in_pipw,
-    countIf(source_file = 'R1IPW') > 0      AS in_r1ipw,
+    countIf(source_file = 'RIPW') > 0      AS in_ripw,
     countIf(source_file = 'YIPW')  > 0      AS in_yipw,
 
     -- Status classification
@@ -85,11 +88,11 @@ SELECT
         -- Not in all 3 files
         NOT (
             countIf(source_file = 'PIPW')  > 0 AND
-            countIf(source_file = 'R1IPW') > 0 AND
+            countIf(source_file = 'RIPW') > 0 AND
             countIf(source_file = 'YIPW')  > 0
         ), 'MISSING',
         -- In all 3 but patterns differ
-        maxIf(naptrTxt, source_file = 'PIPW') != maxIf(naptrTxt, source_file = 'R1IPW') OR
+        maxIf(naptrTxt, source_file = 'PIPW') != maxIf(naptrTxt, source_file = 'RIPW') OR
         maxIf(naptrTxt, source_file = 'PIPW') != maxIf(naptrTxt, source_file = 'YIPW'),
         'PATTERN_MISMATCH',
         -- All good
@@ -100,26 +103,26 @@ SELECT
     multiIf(
         -- Missing from all 3
         NOT (countIf(source_file = 'PIPW')  > 0) AND
-        NOT (countIf(source_file = 'R1IPW') > 0) AND
+        NOT (countIf(source_file = 'RIPW') > 0) AND
         NOT (countIf(source_file = 'YIPW')  > 0),
             'Missing from all 3',
 
         -- Missing from 2 files
         NOT (countIf(source_file = 'PIPW')  > 0) AND
-        NOT (countIf(source_file = 'R1IPW') > 0),
-            'Missing from PIPW, R1IPW',
+        NOT (countIf(source_file = 'RIPW') > 0),
+            'Missing from PIPW, RIPW',
 
         NOT (countIf(source_file = 'PIPW')  > 0) AND
         NOT (countIf(source_file = 'YIPW')  > 0),
             'Missing from PIPW, YIPW',
 
-        NOT (countIf(source_file = 'R1IPW') > 0) AND
+        NOT (countIf(source_file = 'RIPW') > 0) AND
         NOT (countIf(source_file = 'YIPW')  > 0),
-            'Missing from R1IPW, YIPW',
+            'Missing from RIPW, YIPW',
 
         -- Missing from exactly 1 file
         NOT (countIf(source_file = 'PIPW')  > 0), 'Missing from PIPW',
-        NOT (countIf(source_file = 'R1IPW') > 0), 'Missing from R1IPW',
+        NOT (countIf(source_file = 'RIPW') > 0), 'Missing from RIPW',
         NOT (countIf(source_file = 'YIPW')  > 0), 'Missing from YIPW',
 
         -- Not missing (consistent or mismatch)
@@ -132,6 +135,7 @@ GROUP BY msisdn, process_date;
 -- ============================================================================
 -- 4. SUMMARY VIEW — aggregated counts per process_date
 --    Used by the Streamlit Reconciliation tab summary metrics row
+--    FINAL ensures deduplication from ReplacingMergeTree
 -- ============================================================================
 CREATE OR REPLACE VIEW default.ipw_summary AS
 SELECT

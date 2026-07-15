@@ -6,8 +6,14 @@ import plotly.express as px
 from plotly.subplots import make_subplots
 import clickhouse_connect
 import os
+import io
+import json
+import hashlib
+from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
+from pcgt_audit import render_pcgt_audit_tab
+from cnacld_tab import render_cnacld_tab
 
 # Page config - MUST be first Streamlit command
 st.set_page_config(page_title="e& CS Core Operations", page_icon="📡", layout="wide")
@@ -21,13 +27,21 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# SET USERNAME AND PASSWORD
-USERNAME = "admin"
-PASSWORD = "admin"
+# ─── Users & Roles ───
+# viewer   → can view data and reserve, but cannot upload files
+# uploader → all viewer privileges PLUS can upload audit/Huawei/Ericsson files
+USERS = {
+    "admin":   {"password": "admin",      "role": "viewer"},
+    "manager": {"password": "manager123", "role": "uploader"},
+}
 
 # LOGIN CHECK
 if 'authenticated' not in st.session_state:
     st.session_state.authenticated = False
+if 'user_role' not in st.session_state:
+    st.session_state.user_role = None
+if 'username' not in st.session_state:
+    st.session_state.username = None
 
 def login():
     st.markdown("<h1 style='color: #A40000;'>📡 e& CS Core Operations</h1>", unsafe_allow_html=True)
@@ -35,8 +49,11 @@ def login():
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
     if st.button("Login"):
-        if username == USERNAME and password == PASSWORD:
+        user = USERS.get(username)
+        if user and user["password"] == password:
             st.session_state.authenticated = True
+            st.session_state.username = username
+            st.session_state.user_role = user["role"]
             st.rerun()
         else:
             st.error("Wrong username or password")
@@ -111,6 +128,68 @@ def get_user_lookup_result(query):
     rows, columns = run_user_lookup_cached(query)
     return list(rows), columns
 
+# ============================================================================
+# SERVER-SIDE FILE CACHE - Pre-computed results persist across restarts
+# Data is processed daily, so results for a given date NEVER change.
+# Cache files are stored on disk and loaded instantly on login.
+# ============================================================================
+CACHE_DIR = Path(os.getenv('CACHE_DIR', '/app/cache'))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+def _cache_path(date_str, cache_key):
+    """Get the file path for a specific cache entry"""
+    return CACHE_DIR / f"{date_str}" / f"{cache_key}.json"
+
+def get_server_cache(date_str, cache_key):
+    """Load pre-computed results from disk. Returns None if not cached."""
+    path = _cache_path(date_str, cache_key)
+    if path.exists():
+        try:
+            with open(path, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+    return None
+
+def set_server_cache(date_str, cache_key, data):
+    """Save pre-computed results to disk."""
+    path = _cache_path(date_str, cache_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(data, f)
+
+def run_cached_query_with_disk(query, date_str, cache_key):
+    """Query with server-side disk cache. Checks disk first, then DB."""
+    cached = get_server_cache(date_str, cache_key)
+    if cached is not None:
+        rows = tuple(tuple(row) for row in cached['rows'])
+        columns = tuple(cached['columns'])
+        return rows, columns
+    # Not on disk — query DB and save
+    rows, columns = run_cached_query(query)
+    # Serialize: convert date/datetime objects to strings for JSON
+    serializable_rows = []
+    for row in rows:
+        serializable_row = []
+        for val in row:
+            if isinstance(val, (date, datetime)):
+                serializable_row.append(val.isoformat())
+            else:
+                serializable_row.append(val)
+        serializable_rows.append(serializable_row)
+    set_server_cache(date_str, cache_key, {
+        'rows': serializable_rows,
+        'columns': list(columns)
+    })
+    return rows, columns
+
+def clear_date_cache(date_str):
+    """Clear all cached files for a specific date"""
+    cache_dir = CACHE_DIR / f"{date_str}"
+    if cache_dir.exists():
+        for f in cache_dir.iterdir():
+            f.unlink()
+
 # Test connection (quick check)
 try:
     test_client = get_clickhouse_pool()
@@ -121,12 +200,27 @@ except Exception as e:
     st.error(f"Database connection failed: {e}")
     st.stop()
 
+# Sidebar - User info + logout
+_role_icon = "👑" if st.session_state.user_role == "uploader" else "👤"
+st.sidebar.markdown(
+    f"{_role_icon} **{st.session_state.username}** "
+    f"(_{st.session_state.user_role}_)"
+)
+if st.sidebar.button("🚪 Logout", key="sidebar_logout"):
+    st.session_state.authenticated = False
+    st.session_state.username = None
+    st.session_state.user_role = None
+    st.rerun()
+
 # Sidebar - Date Selection
 st.sidebar.title("⚙️ Settings")
 
 # Get all available UDC dates with counts in a single query
 try:
-    rows, _ = run_cached_query("SELECT CDRtime, count() AS cnt FROM default.dump GROUP BY CDRtime ORDER BY CDRtime DESC")
+    rows, _ = run_cached_query_with_disk(
+        "SELECT CDRtime, count() AS cnt FROM default.dump GROUP BY CDRtime ORDER BY CDRtime DESC",
+        "global", "available_dates"
+    )
     available_udc_dates = []
     date_counts = {}
     for row in rows:
@@ -169,6 +263,9 @@ cdr_date_str_dash = cdr_date.strftime('%Y-%m-%d')
 
 # Add refresh button in sidebar
 if st.sidebar.button("🔄 Refresh Data"):
+    # Clear server-side disk cache for current date + global cache
+    clear_date_cache(cdr_date_str)
+    clear_date_cache("global")
     st.cache_data.clear()
     st.cache_resource.clear()
     st.rerun()
@@ -182,7 +279,132 @@ else:
     st.sidebar.success(f"✓ {date_count:,} records for {cdr_date_str}")
 
 # Create tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Statistics", "🔍 User Lookup", "🔎 Advanced Search & Filter", "📱 MNP Analysis", "🗂️ Reconciliation"])
+# ============================================================================
+# EXCEL EXPORT HELPERS
+# ============================================================================
+def _write_styled_sheet(ws, df, title=None):
+    """Write a DataFrame to an openpyxl worksheet with e& brand styling."""
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    header_fill = PatternFill(start_color="A40000", end_color="A40000", fill_type="solid")
+    alt_fill    = PatternFill(start_color="FFF5F5", end_color="FFF5F5", fill_type="solid")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    data_font   = Font(size=10)
+    thin_side   = Side(style="thin", color="DDDDDD")
+    cell_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+    center      = Alignment(horizontal="center", vertical="center")
+
+    if title:
+        ws.append([title])
+        ws.cell(row=ws.max_row, column=1).font = Font(bold=True, size=13, color="A40000")
+        ws.append([])
+
+    header_row = ws.max_row + 1
+    for ci, col_name in enumerate(df.columns, 1):
+        c = ws.cell(row=header_row, column=ci, value=str(col_name))
+        c.fill = header_fill
+        c.font = header_font
+        c.alignment = center
+        c.border = cell_border
+
+    for ri, row_vals in enumerate(df.itertuples(index=False), header_row + 1):
+        fill = alt_fill if ri % 2 == 0 else PatternFill()
+        for ci, val in enumerate(row_vals, 1):
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.fill = fill
+            c.font = data_font
+            c.alignment = center
+            c.border = cell_border
+
+    for ci, col_name in enumerate(df.columns, 1):
+        col_vals = df.iloc[:, ci - 1].astype(str)
+        max_len = max(len(str(col_name)), col_vals.str.len().max() if len(df) > 0 else 0)
+        ws.column_dimensions[get_column_letter(ci)].width = min(int(max_len) + 4, 45)
+
+
+def create_stats_excel_report(date_str, total_subs, volte_subs, vowifi_subs, fiveg_subs,
+                               roaming_subs, local_subs, fvno_subs,
+                               data_sims_total, data_2g3g, data_4g, data_5g, corporate_data,
+                               df_tick, df_network, df_vowifi, features_data,
+                               df_country, df_operator_display):
+    """Generate a formatted multi-sheet Excel report for the Statistics tab."""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    safe_pct = lambda num, den: f"{num/den*100:.1f}%" if den > 0 else "N/A"
+
+    # Sheet 1: KPI Summary
+    ws = wb.create_sheet("KPI Summary")
+    kpi_rows = [
+        ("Voice",     "Total Subscribers",      total_subs,      "100.0%"),
+        ("Voice",     "VoLTE Subscribers",       volte_subs,      safe_pct(volte_subs, total_subs)),
+        ("Voice",     "VoWiFi Subscribers",      vowifi_subs,     safe_pct(vowifi_subs, total_subs)),
+        ("Voice",     "5G Subscribers",          fiveg_subs,      safe_pct(fiveg_subs, total_subs)),
+        ("Roaming",   "Roaming Subscribers",     roaming_subs,    safe_pct(roaming_subs, total_subs)),
+        ("Roaming",   "Egypt/Local Subscribers", local_subs,      safe_pct(local_subs, total_subs)),
+        ("Roaming",   "Fixed FVNO Subscribers",  fvno_subs,       safe_pct(fvno_subs, total_subs)),
+        ("Data SIMs", "Total Data SIMs",         data_sims_total, safe_pct(data_sims_total, total_subs)),
+        ("Data SIMs", "2G/3G Data SIMs",         data_2g3g,       safe_pct(data_2g3g, data_sims_total)),
+        ("Data SIMs", "4G Data SIMs",            data_4g,         safe_pct(data_4g, data_sims_total)),
+        ("Data SIMs", "5G Data SIMs",            data_5g,         safe_pct(data_5g, data_sims_total)),
+        ("Data SIMs", "Corporate Data",          corporate_data,  safe_pct(corporate_data, total_subs)),
+    ]
+    kpi_df = pd.DataFrame(kpi_rows, columns=["Category", "Metric", "Subscribers", "% of Total"])
+    _write_styled_sheet(ws, kpi_df, f"e& CS Core Operations — KPI Summary ({date_str})")
+
+    # Sheet 2: CS Service Distribution
+    if not df_tick.empty:
+        ws = wb.create_sheet("CS Service Distribution")
+        export_df = df_tick[['Service Type', 'Subscribers', 'Percentage']].copy()
+        export_df['Percentage'] = export_df['Percentage'].apply(lambda x: f"{x:.1f}%")
+        _write_styled_sheet(ws, export_df, "CS Service Type Distribution")
+
+    # Sheet 3: Network Distribution
+    if not df_network.empty:
+        ws = wb.create_sheet("Network Distribution")
+        net_df = df_network.copy()
+        total_net = net_df['Subscribers'].sum()
+        net_df['% of Total'] = net_df['Subscribers'].apply(lambda x: safe_pct(x, total_net))
+        _write_styled_sheet(ws, net_df, "Network Technology Distribution")
+
+    # Sheet 4: VoWiFi Status
+    if not df_vowifi.empty:
+        ws = wb.create_sheet("VoWiFi Status")
+        wifi_df = df_vowifi.copy()
+        total_wifi = wifi_df['Subscribers'].sum()
+        wifi_df['% of Total'] = wifi_df['Subscribers'].apply(lambda x: safe_pct(x, total_wifi))
+        _write_styled_sheet(ws, wifi_df, "VoWiFi Access Distribution")
+
+    # Sheet 5: Call Features
+    if not features_data.empty:
+        ws = wb.create_sheet("Call Features")
+        feat_df = features_data[['Feature', 'Count', 'Percentage']].copy()
+        feat_df = feat_df.rename(columns={'Count': 'Subscribers'})
+        feat_df['Percentage'] = feat_df['Percentage'].apply(lambda x: f"{x:.1f}%")
+        _write_styled_sheet(ws, feat_df, "Call Features Adoption")
+
+    # Sheet 6: Roaming by Country
+    if not df_country.empty:
+        ws = wb.create_sheet("Roaming by Country")
+        country_df = df_country.copy()
+        total_roam = country_df['Subscribers'].sum()
+        country_df['% of Roaming'] = country_df['Subscribers'].apply(lambda x: safe_pct(x, total_roam))
+        _write_styled_sheet(ws, country_df, "Top Roaming Countries")
+
+    # Sheet 7: Roaming by Operator
+    if not df_operator_display.empty:
+        ws = wb.create_sheet("Roaming by Operator")
+        _write_styled_sheet(ws, df_operator_display, "Top Roaming Operators")
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
+
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(["📊 Statistics", "🔍 User Lookup", "🔎 Advanced Search & Filter", "📱 MNP Analysis", "🗂️ Reconciliation", "📈 Historical Trends", "🔒 PC/GT Audit", "📡 CNACLD Extractor"])
 
 # ==================== TAB 1: STATISTICS ====================
 with tab1:
@@ -191,7 +413,7 @@ with tab1:
     # ==================== VOICE STATISTICS SECTION ====================
     st.subheader("📞 Voice Statistics")
 
-    # COMBINED QUERY: All voice metrics in a single scan
+    # COMBINED QUERY: All voice metrics in a single scan (disk-cached per date)
     voice_metrics_query = f"""
         SELECT
             uniqExact(MSISDN) AS total_subs,
@@ -204,7 +426,7 @@ with tab1:
         FROM default.dump
         WHERE CDRtime = '{cdr_date_str_dash}'
     """
-    rows, _ = run_cached_query(voice_metrics_query)
+    rows, _ = run_cached_query_with_disk(voice_metrics_query, cdr_date_str, "voice_metrics")
     total_subs, volte_subs, vowifi_subs, fiveg_subs, roaming_subs, local_subs, fvno_subs = rows[0]
 
     # Main metrics
@@ -254,7 +476,7 @@ with tab1:
             HAVING service_type IS NOT NULL
             ORDER BY subscribers DESC
         """
-        rows, cols = run_cached_query(query)
+        rows, cols = run_cached_query_with_disk(query, cdr_date_str, "cs_service_distribution")
         df_tick = pd.DataFrame(rows, columns=['Service Type', 'Subscribers'])
 
         # Calculate total CS subscribers and percentages
@@ -296,7 +518,7 @@ with tab1:
             GROUP BY network_type
             ORDER BY subscribers DESC
         """
-        rows, cols = run_cached_query(query)
+        rows, cols = run_cached_query_with_disk(query, cdr_date_str, "network_distribution")
         df_network = pd.DataFrame(rows, columns=['Network Type', 'Subscribers'])
         # Remove NULL values from the chart
         df_network = df_network[df_network['Network Type'].notna()]
@@ -341,7 +563,7 @@ with tab1:
             HAVING status IS NOT NULL
             ORDER BY subscribers DESC
         """
-        rows, cols = run_cached_query(query)
+        rows, cols = run_cached_query_with_disk(query, cdr_date_str, "vowifi_distribution")
         df_vowifi = pd.DataFrame(rows, columns=['VoWiFi Status', 'Subscribers'])
 
         # Create color mapping
@@ -376,7 +598,7 @@ with tab1:
             FROM default.dump
             WHERE CDRtime = '{cdr_date_str_dash}'
         """
-        rows, _ = run_cached_query(query)
+        rows, _ = run_cached_query_with_disk(query, cdr_date_str, "call_features")
         cfu, cfb, hold, caw, mcn, clir, colp, total = rows[0]
 
         features_data = pd.DataFrame({
@@ -421,6 +643,280 @@ with tab1:
         fvno_pct = (fvno_subs / total_subs * 100) if total_subs > 0 else 0
         st.metric("Fixed FVNO", f"{fvno_subs:,}", f"{fvno_pct:.1f}%", delta_color="normal")
 
+    # Roaming subscribers by country (top 10)
+    df_country = pd.DataFrame()
+    roaming_country_query = f"""
+        SELECT
+            CASE
+                WHEN startsWith(VLRADD, '19966') THEN 'Saudi Arabia'
+                WHEN startsWith(VLRADD, '19971') THEN 'UAE'
+                WHEN startsWith(VLRADD, '19218') THEN 'Libya'
+                WHEN startsWith(VLRADD, '19249') THEN 'Sudan'
+                WHEN startsWith(VLRADD, '19965') THEN 'Kuwait'
+                WHEN startsWith(VLRADD, '19962') THEN 'Jordan'
+                WHEN startsWith(VLRADD, '19963') THEN 'Syria'
+                WHEN startsWith(VLRADD, '19964') THEN 'Iraq'
+                WHEN startsWith(VLRADD, '19968') THEN 'Oman'
+                WHEN startsWith(VLRADD, '19974') THEN 'Qatar'
+                WHEN startsWith(VLRADD, '19973') THEN 'Bahrain'
+                WHEN startsWith(VLRADD, '19967') THEN 'Yemen'
+                WHEN startsWith(VLRADD, '19961') THEN 'Lebanon'
+                WHEN startsWith(VLRADD, '19972') THEN 'Palestine'
+                WHEN startsWith(VLRADD, '19212') THEN 'Morocco'
+                WHEN startsWith(VLRADD, '19213') THEN 'Algeria'
+                WHEN startsWith(VLRADD, '19216') THEN 'Tunisia'
+                WHEN startsWith(VLRADD, '19251') THEN 'Ethiopia'
+                WHEN startsWith(VLRADD, '1944')  THEN 'UK'
+                WHEN startsWith(VLRADD, '1933')  THEN 'France'
+                WHEN startsWith(VLRADD, '1949')  THEN 'Germany'
+                WHEN startsWith(VLRADD, '1939')  THEN 'Italy'
+                WHEN startsWith(VLRADD, '1934')  THEN 'Spain'
+                WHEN startsWith(VLRADD, '1931')  THEN 'Netherlands'
+                ELSE 'Other'
+            END AS country,
+            uniq(MSISDN) AS subscriber_count
+        FROM default.dump
+        WHERE CDRtime = '{cdr_date_str_dash}'
+          AND VLRADD != ''
+          AND VLRADD IS NOT NULL
+          AND NOT startsWith(VLRADD, '1920117900')
+        GROUP BY country
+        HAVING country != 'Other'
+        ORDER BY subscriber_count DESC
+        LIMIT 10
+    """
+    try:
+        country_rows, _ = run_cached_query_with_disk(roaming_country_query, cdr_date_str, "roaming_country_distribution")
+        if country_rows:
+            df_country = pd.DataFrame(country_rows, columns=['Country', 'Subscribers'])
+
+            col_chart1, col_chart2 = st.columns([3, 2])
+
+            with col_chart1:
+                fig_bar = go.Figure(go.Bar(
+                    x=df_country['Subscribers'],
+                    y=df_country['Country'],
+                    orientation='h',
+                    marker_color='#3498db',
+                    text=df_country['Subscribers'].apply(lambda v: f"{v:,}"),
+                    textposition='outside'
+                ))
+                fig_bar.update_layout(
+                    title="Top 10 Roaming Countries (Subscriber Count)",
+                    xaxis_title="Subscribers",
+                    yaxis=dict(autorange='reversed'),
+                    height=400,
+                    plot_bgcolor='white',
+                    xaxis=dict(showgrid=True, gridcolor='lightgrey'),
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+            with col_chart2:
+                fig_pie = px.pie(
+                    df_country,
+                    names='Country',
+                    values='Subscribers',
+                    title="Roaming Share by Country"
+                )
+                fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                fig_pie.update_layout(height=400, showlegend=False)
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+            st.dataframe(df_country, use_container_width=True, hide_index=True)
+    except Exception as e:
+        st.error(f"Error loading roaming country data: {e}")
+
+    st.markdown("---")
+
+    # ==================== TOP 10 ROAMING OPERATORS SECTION ====================
+    st.subheader("📡 Top 10 Roaming Operators")
+
+    df_operator_display = pd.DataFrame()
+    roaming_operator_query = f"""
+        SELECT
+            CASE
+                -- Saudi Arabia (966)
+                WHEN startsWith(VLRADD, '1996650') THEN 'Saudi Arabia - STC'
+                WHEN startsWith(VLRADD, '1996656') THEN 'Saudi Arabia - Mobily'
+                WHEN startsWith(VLRADD, '1996659') THEN 'Saudi Arabia - Zain'
+                -- UAE (971)
+                WHEN startsWith(VLRADD, '1997150') THEN 'UAE - Etisalat'
+                WHEN startsWith(VLRADD, '1997155') THEN 'UAE - du'
+                -- Kuwait (965)
+                WHEN startsWith(VLRADD, '19965500') THEN 'Kuwait - STC'
+                WHEN startsWith(VLRADD, '1996596')  THEN 'Kuwait - Zain'
+                WHEN startsWith(VLRADD, '199656')   THEN 'Kuwait - Ooredoo'
+                -- Qatar (974)
+                WHEN startsWith(VLRADD, '1997477') THEN 'Qatar - Ooredoo'
+                WHEN startsWith(VLRADD, '1997455') THEN 'Qatar - Vodafone'
+                -- Jordan (962)
+                WHEN startsWith(VLRADD, '1996279') THEN 'Jordan - Orange'
+                WHEN startsWith(VLRADD, '1996277') THEN 'Jordan - Umniah'
+                WHEN startsWith(VLRADD, '1996278') THEN 'Jordan - Zain'
+                -- Bahrain (973)
+                WHEN startsWith(VLRADD, '1997333') THEN 'Bahrain - STC'
+                WHEN startsWith(VLRADD, '1997336') THEN 'Bahrain - Zain'
+                WHEN startsWith(VLRADD, '1997339') THEN 'Bahrain - Batelco'
+                -- Iraq (964)
+                WHEN startsWith(VLRADD, '199647701') THEN 'Iraq - Asiacell'
+                WHEN startsWith(VLRADD, '199647802') THEN 'Iraq - Korek'
+                WHEN startsWith(VLRADD, '1996475')   THEN 'Iraq - Zain'
+                -- Syria (963)
+                WHEN startsWith(VLRADD, '1996394') THEN 'Syria - Syriatel'
+                WHEN startsWith(VLRADD, '1996393') THEN 'Syria - MTN'
+                -- Yemen (967)
+                WHEN startsWith(VLRADD, '1996771') THEN 'Yemen - Sabafon'
+                WHEN startsWith(VLRADD, '1996770') THEN 'Yemen - MTN'
+                -- Oman (968)
+                WHEN startsWith(VLRADD, '1996895') THEN 'Oman - Ooredoo'
+                WHEN startsWith(VLRADD, '1996892') THEN 'Oman - Omantel'
+                -- Libya (218)
+                WHEN startsWith(VLRADD, '1921891') THEN 'Libya - Almadar'
+                WHEN startsWith(VLRADD, '1921892') THEN 'Libya - Libyana'
+                -- Lebanon (961)
+                WHEN startsWith(VLRADD, '1996134') THEN 'Lebanon - Alfa'
+                WHEN startsWith(VLRADD, '1996139') THEN 'Lebanon - Touch'
+                -- Palestine (972)
+                WHEN startsWith(VLRADD, '1997259') THEN 'Palestine - Jawwal'
+                WHEN startsWith(VLRADD, '1997256') THEN 'Palestine - Ooredoo'
+                -- Sudan (249)
+                WHEN startsWith(VLRADD, '1924991') THEN 'Sudan - Zain'
+                WHEN startsWith(VLRADD, '1924912') THEN 'Sudan - Sudani'
+                WHEN startsWith(VLRADD, '1924995') THEN 'Sudan - Vivacell'
+                -- Morocco (212)
+                WHEN startsWith(VLRADD, '192126639') THEN 'Morocco - Orange'
+                WHEN startsWith(VLRADD, '19212661')  THEN 'Morocco - Maroc Telecom'
+                WHEN startsWith(VLRADD, '19212640')  THEN 'Morocco - inwi'
+                -- Algeria (213)
+                WHEN startsWith(VLRADD, '19213661') THEN 'Algeria - Mobilis'
+                WHEN startsWith(VLRADD, '19213770') THEN 'Algeria - Djezzy'
+                WHEN startsWith(VLRADD, '1921350')  THEN 'Algeria - Ooredoo'
+                -- Tunisia (216)
+                WHEN startsWith(VLRADD, '192165')  THEN 'Tunisia - Tunisie Telecom'
+                WHEN startsWith(VLRADD, '1921622') THEN 'Tunisia - Ooredoo'
+                WHEN startsWith(VLRADD, '1921698') THEN 'Tunisia - Orange'
+                -- Ethiopia (251)
+                WHEN startsWith(VLRADD, '1925191') THEN 'Ethiopia - Ethio Telecom'
+                -- Turkey (90)
+                WHEN startsWith(VLRADD, '1990505') THEN 'Turkey - Turk Telekom'
+                WHEN startsWith(VLRADD, '1990559') THEN 'Turkey - Turkcell'
+                WHEN startsWith(VLRADD, '1990532') THEN 'Turkey - Vodafone'
+                -- UK (44)
+                WHEN startsWith(VLRADD, '19447781')  THEN 'UK - O2'
+                WHEN startsWith(VLRADD, '19447782')  THEN 'UK - EE'
+                WHEN startsWith(VLRADD, '19447802')  THEN 'UK - EE'
+                WHEN startsWith(VLRADD, '1944973')   THEN 'UK - Vodafone'
+                WHEN startsWith(VLRADD, '19447953')  THEN 'UK - O2'
+                WHEN startsWith(VLRADD, '1944385')   THEN 'UK - Vodafone'
+                WHEN startsWith(VLRADD, '194478297') THEN 'UK - Vodafone'
+                WHEN startsWith(VLRADD, '19447624')  THEN 'UK - Vodafone'
+                WHEN startsWith(VLRADD, '19447797')  THEN 'UK - Sure'
+                -- France (33)
+                WHEN startsWith(VLRADD, '1933660') THEN 'France - Bouygues'
+                WHEN startsWith(VLRADD, '1933689') THEN 'France - Orange'
+                WHEN startsWith(VLRADD, '1933609') THEN 'France - SFR'
+                WHEN startsWith(VLRADD, '1933695') THEN 'France - Free'
+                -- Germany (49)
+                WHEN startsWith(VLRADD, '1949176') THEN 'Germany - O2'
+                WHEN startsWith(VLRADD, '1949177') THEN 'Germany - Telekom'
+                WHEN startsWith(VLRADD, '1949171') THEN 'Germany - Vodafone'
+                WHEN startsWith(VLRADD, '1949172') THEN 'Germany - O2'
+                -- Italy (39)
+                WHEN startsWith(VLRADD, '1939391')  THEN 'Italy - Wind Tre'
+                WHEN startsWith(VLRADD, '1939339')  THEN 'Italy - Wind Tre'
+                WHEN startsWith(VLRADD, '1939320')  THEN 'Italy - Wind Tre'
+                WHEN startsWith(VLRADD, '1939335')  THEN 'Italy - TIM'
+                WHEN startsWith(VLRADD, '1939349')  THEN 'Italy - TIM'
+                WHEN startsWith(VLRADD, '19393519') THEN 'Italy - TIM'
+                -- Spain (34)
+                WHEN startsWith(VLRADD, '19346404') THEN 'Spain - Airtel'
+                WHEN startsWith(VLRADD, '1934607')  THEN 'Spain - Movistar'
+                WHEN startsWith(VLRADD, '1934609')  THEN 'Spain - Orange'
+                WHEN startsWith(VLRADD, '1934622')  THEN 'Spain - Yoigo'
+                -- Pakistan (92)
+                WHEN startsWith(VLRADD, '1992345') THEN 'Pakistan - Jazz'
+                WHEN startsWith(VLRADD, '1992333') THEN 'Pakistan - Jazz'
+                WHEN startsWith(VLRADD, '1992321') THEN 'Pakistan - Jazz'
+                WHEN startsWith(VLRADD, '199231')  THEN 'Pakistan - Jazz'
+                WHEN startsWith(VLRADD, '1992300') THEN 'Pakistan - Zong'
+                -- India (91)
+                WHEN startsWith(VLRADD, '199197')  THEN 'India - Aircell'
+                WHEN startsWith(VLRADD, '199198')  THEN 'India - Airtel'
+                WHEN startsWith(VLRADD, '1991981') THEN 'India - Airtel'
+                WHEN startsWith(VLRADD, '199195')  THEN 'India - Tata'
+                WHEN startsWith(VLRADD, '199196')  THEN 'India - Vodafone Idea'
+                -- Netherlands (31)
+                WHEN startsWith(VLRADD, '193165') THEN 'Netherlands - KPN'
+                WHEN startsWith(VLRADD, '193162') THEN 'Netherlands - Vodafone'
+                WHEN startsWith(VLRADD, '193154') THEN 'Netherlands - T-Mobile'
+                WHEN startsWith(VLRADD, '193163') THEN 'Netherlands - T-Mobile'
+                ELSE ''
+            END AS operator_label,
+            uniq(MSISDN) AS subscriber_count
+        FROM default.dump
+        WHERE CDRtime = '{cdr_date_str_dash}'
+          AND VLRADD != ''
+          AND VLRADD IS NOT NULL
+          AND NOT startsWith(VLRADD, '1920117900')
+        GROUP BY operator_label
+        HAVING operator_label != ''
+        ORDER BY subscriber_count DESC
+        LIMIT 10
+    """
+    try:
+        operator_rows, _ = run_cached_query_with_disk(roaming_operator_query, cdr_date_str, "roaming_operator_distribution")
+        if operator_rows:
+            df_operator = pd.DataFrame(operator_rows, columns=['Operator', 'Subscribers'])
+
+            col_chart1, col_chart2 = st.columns([3, 2])
+
+            with col_chart1:
+                fig_bar = go.Figure(go.Bar(
+                    x=df_operator['Subscribers'],
+                    y=df_operator['Operator'],
+                    orientation='h',
+                    marker_color='#e74c3c',
+                    text=df_operator['Subscribers'].apply(lambda v: f"{v:,}"),
+                    textposition='outside'
+                ))
+                fig_bar.update_layout(
+                    title="Top 10 Roaming Operators (Subscriber Count)",
+                    xaxis_title="Subscribers",
+                    yaxis=dict(autorange='reversed'),
+                    height=400,
+                    plot_bgcolor='white',
+                    xaxis=dict(showgrid=True, gridcolor='lightgrey'),
+                )
+                st.plotly_chart(fig_bar, use_container_width=True)
+
+            with col_chart2:
+                fig_pie = px.pie(
+                    df_operator,
+                    names='Operator',
+                    values='Subscribers',
+                    title="Roaming Share by Operator"
+                )
+                fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                fig_pie.update_layout(height=400, showlegend=False)
+                st.plotly_chart(fig_pie, use_container_width=True)
+
+            # Split "Country - Operator" into separate columns for cleaner display
+            df_operator_display = df_operator.copy()
+            split_result = df_operator_display['Operator'].str.split(' - ', n=1, expand=True)
+            df_operator_display.insert(0, 'Country', split_result[0])
+            df_operator_display['Operator'] = split_result[1] if 1 in split_result.columns else split_result[0]
+            total_roaming = df_operator_display['Subscribers'].sum()
+            df_operator_display['% of Shown'] = (
+                df_operator_display['Subscribers'] / total_roaming * 100
+            ).map(lambda v: f"{v:.1f}%")
+            st.dataframe(
+                df_operator_display[['Country', 'Operator', 'Subscribers', '% of Shown']],
+                use_container_width=True,
+                hide_index=True
+            )
+    except Exception as e:
+        st.error(f"Error loading roaming operator data: {e}")
+
     st.markdown("---")
 
     # ==================== DATA SIMs STATISTICS SECTION ====================
@@ -453,7 +949,7 @@ with tab1:
         FROM default.dump
         WHERE CDRtime = '{cdr_date_str_dash}'
     """
-    rows, _ = run_cached_query(data_sims_query)
+    rows, _ = run_cached_query_with_disk(data_sims_query, cdr_date_str, "data_sims_metrics")
     data_sims_total, data_2g3g, data_5g, corporate_data = rows[0]
     data_4g = max(0, data_sims_total - data_2g3g - data_5g)
 
@@ -527,7 +1023,7 @@ with tab1:
             ORDER BY subscribers DESC
             LIMIT 10
         """
-        rows, _ = run_cached_query(query)
+        rows, _ = run_cached_query_with_disk(query, cdr_date_str, "data_sims_eps_profile")
         df_eps = pd.DataFrame(rows, columns=['EpsProfileId', 'Subscribers'])
         # Convert EpsProfileId to string to treat as categorical
         df_eps['EpsProfileId'] = df_eps['EpsProfileId'].astype(str)
@@ -543,6 +1039,25 @@ with tab1:
         fig.update_layout(showlegend=False, xaxis_title="EpsProfileId", yaxis_title="Subscribers",
                          xaxis={'type': 'category', 'categoryorder': 'total descending'})
         st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.subheader("📥 Export Statistics Report")
+    st.markdown("Download all statistics as a formatted Excel workbook with separate sheets for each section.")
+    excel_bytes = create_stats_excel_report(
+        date_str=cdr_date_str,
+        total_subs=total_subs, volte_subs=volte_subs, vowifi_subs=vowifi_subs, fiveg_subs=fiveg_subs,
+        roaming_subs=roaming_subs, local_subs=local_subs, fvno_subs=fvno_subs,
+        data_sims_total=data_sims_total, data_2g3g=data_2g3g, data_4g=data_4g,
+        data_5g=data_5g, corporate_data=corporate_data,
+        df_tick=df_tick, df_network=df_network, df_vowifi=df_vowifi,
+        features_data=features_data, df_country=df_country, df_operator_display=df_operator_display,
+    )
+    st.download_button(
+        label="📊 Download Statistics Report (Excel)",
+        data=excel_bytes,
+        file_name=f"eand_core_stats_{cdr_date_str}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
 
 # ==================== TAB 2: USER LOOKUP ====================
 with tab2:
@@ -1409,16 +1924,15 @@ with tab4:
                     """
                 else:
                     # Other operators (Vodafone/Orange/WE) numbers that ported OUT to Etisalat
-                    # These appear in Etisalat's QPM records (ported IN to Etisalat)
+                    # Prefix = operator's own prefix, NPREFIX = QPM (ported to Etisalat)
                     query = f"""
                         SELECT
                             MSISDN,
                             'Etisalat' AS ported_to,
                             Date
                         FROM default.MNP_details
-                        WHERE Prefix = '2011'
+                        WHERE Prefix = '{prefix}'
                           AND NPREFIX = 'QPM'
-                          AND MSISDN LIKE '{prefix}%'
                         ORDER BY rand()
                         LIMIT {sample_size}
                     """
@@ -1426,26 +1940,26 @@ with tab4:
                 # Ported In - numbers coming TO this operator from others
                 if selected_operator == 'Etisalat':
                     # Numbers from other operators (2010/2012/2015) that came TO Etisalat
-                    # These are QPM records with non-2011 MSISDN
+                    # These are QPM records where Prefix is the original operator
                     query = f"""
                         SELECT
                             MSISDN,
-                            CASE
-                                WHEN MSISDN LIKE '2010%' THEN 'Vodafone'
-                                WHEN MSISDN LIKE '2012%' THEN 'Orange'
-                                WHEN MSISDN LIKE '2015%' THEN 'WE'
+                            CASE Prefix
+                                WHEN '2010' THEN 'Vodafone'
+                                WHEN '2012' THEN 'Orange'
+                                WHEN '2015' THEN 'WE'
                                 ELSE 'Unknown'
                             END AS ported_from,
                             Date
                         FROM default.MNP_details
-                        WHERE Prefix = '2011'
-                          AND NPREFIX = 'QPM'
+                        WHERE NPREFIX = 'QPM'
+                          AND Prefix != '2011'
                         ORDER BY rand()
                         LIMIT {sample_size}
                     """
                 else:
                     # Numbers from Etisalat (2011*) that came TO this operator
-                    # These are QPI/QPE/QPQ records (Etisalat numbers ported out)
+                    # These are QPI/QPE/QPQ records with Prefix = '2011'
                     nprefix_code = porting_codes.get(selected_operator, '')
                     query = f"""
                         SELECT
@@ -1836,6 +2350,18 @@ with tab5:
         "**TICK = 215**, **EpsProfileId set**, **EpsIndMappingContextId = 15$2008300586 or 15$1008300586**, "
         "**IMPI set**, and be **present in all 3 IPW nodes** with **consistent NAPTR patterns**."
     )
+
+    # ---- Get IPW last processed date ----
+    ipw_process_date = "No IPW data"
+    try:
+        ipw_date_rows, _ = run_cached_query("SELECT max(process_date) FROM default.ipw_raw")
+        if ipw_date_rows and ipw_date_rows[0][0]:
+            ipw_process_date = str(ipw_date_rows[0][0])
+    except Exception:
+        pass
+
+    st.info(f"📅 UDC data: **{cdr_date_str}**  |  📡 IPW files processed: **{ipw_process_date}**")
+
     # ---- Load unified summary via LEFT JOIN of UDC (TICK=215) with IPW ----
     volte_available = False
     total_volte = 0
@@ -1843,32 +2369,54 @@ with tab5:
     cnt_not_in_ipw = cnt_ipw_missing_node = cnt_ipw_mismatch = 0
 
     try:
-        vh_rows, _ = run_cached_query(f"""
-            SELECT
-                count()  AS total_volte,
-                countIf(
-                    d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
-                    AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
-                    AND d.IMPI != ''
-                    AND ipw.status = 'OK'
-                )  AS healthy,
-                countIf(d.EpsProfileId = '' OR d.EpsProfileId IS NULL)  AS no_profile,
-                countIf(
-                    d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
-                    AND d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586')
-                )  AS wrong_apn,
-                countIf(
-                    d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
-                    AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
-                    AND (d.IMPI = '' OR d.IMPI IS NULL)
-                )  AS missing_impi,
-                countIf(ipw.msisdn IS NULL OR ipw.msisdn = '')  AS not_in_ipw,
-                countIf(ipw.status = 'MISSING')                 AS ipw_missing_node,
-                countIf(ipw.status = 'PATTERN_MISMATCH')        AS ipw_mismatch
-            FROM default.dump AS d
-            LEFT JOIN default.ipw_reconciliation AS ipw ON d.MSISDN = ipw.msisdn
-            WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
-        """)
+        vh_rows, _ = run_cached_query_with_disk(f"""
+            
+
+SELECT
+    count() AS total_volte,
+
+    countIf(
+        d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+        AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+        AND d.IMPI != ''
+        AND ipw.status = 'OK'
+    ) AS healthy,
+
+    countIf(d.EpsProfileId = '' OR d.EpsProfileId IS NULL) AS no_profile,
+
+    countIf(
+        d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+        AND d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586')
+    ) AS wrong_apn,
+
+    countIf(
+        d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+        AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+        AND (d.IMPI = '' OR d.IMPI IS NULL)
+    ) AS missing_impi,
+
+    countIf(ipw.msisdn IS NULL) AS not_in_ipw,
+    countIf(ipw.status = 'MISSING') AS ipw_missing_node,
+    countIf(ipw.status = 'PATTERN_MISMATCH') AS ipw_mismatch
+
+FROM
+(
+    SELECT *
+    FROM default.dump
+    WHERE CDRtime = '{date}'
+      AND TICK = 215
+) d
+
+LEFT JOIN
+(
+    SELECT *
+    FROM default.ipw_reconciliation
+    WHERE process_date = (
+        SELECT max(process_date) FROM default.ipw_reconciliation
+    )
+) ipw
+
+ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
         if vh_rows and vh_rows[0][0] > 0:
             volte_available      = True
             total_volte          = int(vh_rows[0][0])
@@ -2030,9 +2578,9 @@ with tab5:
                     SELECT
                         msisdn, process_date,
                         if(in_pipw,  'Present', 'Missing') AS PIPW,
-                        if(in_r1ipw, 'Present', 'Missing') AS R1IPW,
+                        if(in_ripw, 'Present', 'Missing') AS RIPW,
                         if(in_yipw,  'Present', 'Missing') AS YIPW,
-                        status, pipw_pattern, r1ipw_pattern, yipw_pattern
+                        status, pipw_pattern, ripw_pattern, yipw_pattern
                     FROM default.ipw_reconciliation
                     WHERE msisdn = '{lookup_msisdn}'
                     LIMIT 1
@@ -2043,12 +2591,12 @@ with tab5:
                     st.markdown(f"**IPW Status:** `{status_val}`")
                     c1, c2, c3 = st.columns(3)
                     c1.metric("PIPW",  r[2])
-                    c2.metric("R1IPW", r[3])
+                    c2.metric("RIPW", r[3])
                     c3.metric("YIPW",  r[4])
                     if status_val == 'PATTERN_MISMATCH':
                         st.markdown("**NAPTR Patterns across nodes:**")
                         st.write(pd.DataFrame({
-                            'Node':    ['PIPW',  'R1IPW',  'YIPW'],
+                            'Node':    ['PIPW',  'RIPW',  'YIPW'],
                             'Pattern': [r[6],    r[7],     r[8]]
                         }))
                 else:
@@ -2111,7 +2659,7 @@ with tab5:
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
                             if(ipw.in_pipw, 'Y', 'N')) AS PIPW,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_r1ipw, 'Y', 'N')) AS R1IPW,
+                            if(ipw.in_ripw, 'Y', 'N')) AS RIPW,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
                             if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
                         multiIf(
@@ -2130,7 +2678,7 @@ with tab5:
                 if misc_rows:
                     df_misc = pd.DataFrame(misc_rows, columns=[
                         'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
-                        'PIPW', 'R1IPW', 'YIPW', 'IPW Status'
+                        'PIPW', 'RIPW', 'YIPW', 'IPW Status'
                     ])
                     st.caption(f"Showing first {len(df_misc):,} results")
                     st.dataframe(df_misc, use_container_width=True, height=400)
@@ -2144,7 +2692,7 @@ with tab5:
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
                             if(ipw.in_pipw, 'Y', 'N')) AS PIPW,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_r1ipw, 'Y', 'N')) AS R1IPW,
+                            if(ipw.in_ripw, 'Y', 'N')) AS RIPW,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
                             if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
                         multiIf(
@@ -2163,7 +2711,7 @@ with tab5:
                 if dl_rows:
                     df_dl = pd.DataFrame(dl_rows, columns=[
                         'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
-                        'PIPW', 'R1IPW', 'YIPW', 'IPW Status'
+                        'PIPW', 'RIPW', 'YIPW', 'IPW Status'
                     ])
                     st.download_button(
                         label="Download Misconfigured VoLTE Users (CSV)",
@@ -2173,6 +2721,338 @@ with tab5:
                     )
             except Exception as e:
                 st.error(f"Error loading misconfigured subscribers: {e}")
+
+# ==================== TAB 6: HISTORICAL TRENDS ====================
+with tab6:
+    st.header("📈 Historical Trends")
+    st.markdown(
+        "Subscriber data trends over the last **7 days** based on UDC dump retention. "
+        "The sidebar date selector does **not** affect this tab — all available days are shown."
+    )
+
+    # Master query: single ClickHouse scan for all sections
+    trends_query = """
+        SELECT
+            CDRtime,
+            uniq(MSISDN) AS total_subs,
+            uniqIf(MSISDN, TICK = '215') AS volte_subs,
+            uniqIf(MSISDN, EpsAccessRestriction = '0') AS vowifi_subs,
+            uniqIf(
+                MSISDN,
+                length(EpsProfileId) >= 3
+                AND (EpsProfileId LIKE '3%' OR EpsProfileId LIKE '5%')
+                AND EpsProfileId = PDPCP
+            ) AS fiveg_subs,
+            uniqIf(
+                MSISDN,
+                TICK IN ('190', '201', '203', '205')
+                AND EpsProfileId != ''
+                AND EpsProfileId IS NOT NULL
+            ) AS fourg_cs_subs,
+            uniqIf(
+                MSISDN,
+                TICK IN ('190', '201', '203', '205')
+                AND (EpsProfileId = '' OR EpsProfileId IS NULL)
+            ) AS twog3g_subs,
+            uniqIf(
+                MSISDN,
+                TICK = '215'
+                AND EpsProfileId != ''
+                AND EpsProfileId IS NOT NULL
+                AND EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+                AND IMPI != ''
+                AND IMPI IS NOT NULL
+            ) AS healthy_volte,
+            uniqIf(
+                MSISDN,
+                TICK = '215'
+                AND NOT (
+                    EpsProfileId != ''
+                    AND EpsProfileId IS NOT NULL
+                    AND EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+                    AND IMPI != ''
+                    AND IMPI IS NOT NULL
+                )
+            ) AS unhealthy_volte
+        FROM default.dump
+        WHERE CDRtime >= today() - 7
+        GROUP BY CDRtime
+        ORDER BY CDRtime
+        SETTINGS max_memory_usage = 10000000000
+    """
+
+    trends_available = False
+    df_trends = pd.DataFrame()
+
+    # Disk-cached by today's date — first query of the day hits DB, all subsequent
+    # logins/reruns load instantly from disk. Key rolls over at midnight.
+    try:
+        today_key = date.today().isoformat()
+        trend_rows, trend_cols = run_cached_query_with_disk(
+            trends_query, today_key, "historical_trends_last7"
+        )
+        if trend_rows:
+            df_trends = pd.DataFrame(trend_rows, columns=[
+                'CDRtime', 'total_subs', 'volte_subs', 'vowifi_subs', 'fiveg_subs',
+                'fourg_cs_subs', 'twog3g_subs', 'healthy_volte', 'unhealthy_volte'
+            ])
+            df_trends['CDRtime'] = pd.to_datetime(df_trends['CDRtime'])
+            for col in df_trends.columns[1:]:
+                df_trends[col] = df_trends[col].astype(int)
+            trends_available = True
+        else:
+            st.warning("No historical data found. The UDC table may only contain data for today.")
+    except Exception as e:
+        st.error(f"Error loading historical trend data: {e}")
+
+    if trends_available and len(df_trends) > 0:
+
+        def _trend_layout(fig, title, yaxis_title="Subscribers"):
+            fig.update_layout(
+                title=title,
+                xaxis_title="Date",
+                yaxis_title=yaxis_title,
+                height=400,
+                plot_bgcolor='white',
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                xaxis=dict(showgrid=True, gridcolor='lightgrey', tickformat='%Y-%m-%d'),
+                yaxis=dict(showgrid=True, gridcolor='lightgrey'),
+            )
+            return fig
+
+        latest = df_trends.iloc[-1]
+        has_previous = len(df_trends) >= 2
+        previous = df_trends.iloc[-2] if has_previous else None
+
+        def _delta(col):
+            if previous is None:
+                return None
+            return int(latest[col]) - int(previous[col])
+
+        # ── SECTION 1: Subscriber Volume Trends ──────────────────────────────
+        st.subheader("📊 Subscriber Volume Trends")
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            d = _delta('total_subs')
+            st.metric("Total Subscribers (Latest)", f"{int(latest['total_subs']):,}",
+                      delta=f"{d:+,}" if d is not None else None)
+        with col2:
+            d = _delta('volte_subs')
+            st.metric("VoLTE (Latest)", f"{int(latest['volte_subs']):,}",
+                      delta=f"{d:+,}" if d is not None else None)
+        with col3:
+            d = _delta('vowifi_subs')
+            st.metric("VoWiFi (Latest)", f"{int(latest['vowifi_subs']):,}",
+                      delta=f"{d:+,}" if d is not None else None)
+        with col4:
+            d = _delta('fiveg_subs')
+            st.metric("5G (Latest)", f"{int(latest['fiveg_subs']):,}",
+                      delta=f"{d:+,}" if d is not None else None)
+
+        # Compute day-over-day deltas for line charts
+        df_delta = df_trends[['CDRtime', 'total_subs', 'volte_subs', 'vowifi_subs',
+                               'fiveg_subs', 'healthy_volte', 'unhealthy_volte']].copy()
+        for col in df_delta.columns[1:]:
+            df_delta[col] = df_delta[col].diff().fillna(0).astype(int)
+
+        fig_vol = go.Figure()
+        fig_vol.add_trace(go.Scatter(
+            x=df_delta['CDRtime'], y=df_delta['total_subs'],
+            mode='lines+markers+text', name='Total',
+            line=dict(color='#2c3e50', width=2), marker=dict(size=7),
+            text=df_delta['total_subs'].apply(lambda v: f"{v:+,}"),
+            textposition='top center', textfont=dict(size=9)
+        ))
+        fig_vol.add_trace(go.Scatter(
+            x=df_delta['CDRtime'], y=df_delta['volte_subs'],
+            mode='lines+markers+text', name='VoLTE',
+            line=dict(color='#3498db', width=2), marker=dict(size=7),
+            text=df_delta['volte_subs'].apply(lambda v: f"{v:+,}"),
+            textposition='top center', textfont=dict(size=9)
+        ))
+        fig_vol.add_trace(go.Scatter(
+            x=df_delta['CDRtime'], y=df_delta['vowifi_subs'],
+            mode='lines+markers+text', name='VoWiFi',
+            line=dict(color='#2ecc71', width=2), marker=dict(size=7),
+            text=df_delta['vowifi_subs'].apply(lambda v: f"{v:+,}"),
+            textposition='top center', textfont=dict(size=9)
+        ))
+        fig_vol.add_trace(go.Scatter(
+            x=df_delta['CDRtime'], y=df_delta['fiveg_subs'],
+            mode='lines+markers+text', name='5G',
+            line=dict(color='#9b59b6', width=2), marker=dict(size=7),
+            text=df_delta['fiveg_subs'].apply(lambda v: f"{v:+,}"),
+            textposition='top center', textfont=dict(size=9)
+        ))
+        fig_vol.add_hline(y=0, line_dash='dash', line_color='grey', opacity=0.5)
+        _trend_layout(fig_vol, "Daily Change in Subscriber Counts (vs Previous Day)", yaxis_title="Change in Subscribers")
+        st.plotly_chart(fig_vol, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── SECTION 2: Network Type Distribution Trends ───────────────────────
+        st.subheader("📶 Network Type Distribution Trends")
+
+        display_mode = st.radio(
+            "Display mode:",
+            options=["Absolute Counts", "Percentage of Total"],
+            horizontal=True,
+            key="hist_network_mode"
+        )
+
+        network_cols = ['fiveg_subs', 'volte_subs', 'fourg_cs_subs', 'twog3g_subs']
+        network_labels = ['5G', '4G VoLTE', '4G CS', '2G/3G']
+        network_colors = ['#2ecc71', '#3498db', '#f39c12', '#e74c3c']
+
+        if display_mode == "Percentage of Total":
+            row_totals = df_trends[network_cols].sum(axis=1).replace(0, 1)
+            plot_df = df_trends[network_cols].div(row_totals, axis=0) * 100
+            yaxis_label = "% of Subscribers"
+        else:
+            plot_df = df_trends[network_cols]
+            yaxis_label = "Subscribers"
+
+        fig_net = go.Figure()
+        for col, label, color in zip(network_cols, network_labels, network_colors):
+            fig_net.add_trace(go.Bar(
+                x=df_trends['CDRtime'],
+                y=plot_df[col],
+                name=label,
+                marker_color=color
+            ))
+        fig_net.update_layout(barmode='stack')
+        _trend_layout(fig_net, "Network Type Distribution Over Time", yaxis_title=yaxis_label)
+        st.plotly_chart(fig_net, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── SECTION 3: VoLTE Health Trends ────────────────────────────────────
+        st.subheader("🏥 VoLTE Health Trends")
+        st.markdown(
+            "_Health criteria (UDC-only): TICK=215, EpsProfileId set, "
+            "EpsIndMappingContextId ∈ {15\\$2008300586, 15\\$1008300586}, IMPI set._"
+        )
+
+        total_volte_latest = int(latest['volte_subs'])
+        healthy_latest = int(latest['healthy_volte'])
+        unhealthy_latest = int(latest['unhealthy_volte'])
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            d = _delta('volte_subs')
+            st.metric("Total VoLTE (Latest)", f"{total_volte_latest:,}",
+                      delta=f"{d:+,}" if d is not None else None)
+        with col2:
+            d = _delta('healthy_volte')
+            st.metric("Healthy (Latest)", f"{healthy_latest:,}",
+                      delta=f"{d:+,}" if d is not None else None, delta_color="normal")
+        with col3:
+            d = _delta('unhealthy_volte')
+            st.metric("Unhealthy (Latest)", f"{unhealthy_latest:,}",
+                      delta=f"{d:+,}" if d is not None else None, delta_color="inverse")
+
+        fig_health = go.Figure()
+        fig_health.add_trace(go.Scatter(
+            x=df_delta['CDRtime'], y=df_delta['healthy_volte'],
+            mode='lines+markers+text', name='Healthy VoLTE',
+            line=dict(color='#2ecc71', width=2), marker=dict(size=7),
+            text=df_delta['healthy_volte'].apply(lambda v: f"{v:+,}"),
+            textposition='top center', textfont=dict(size=9)
+        ))
+        fig_health.add_trace(go.Scatter(
+            x=df_delta['CDRtime'], y=df_delta['unhealthy_volte'],
+            mode='lines+markers+text', name='Unhealthy VoLTE',
+            line=dict(color='#e74c3c', width=2), marker=dict(size=7),
+            text=df_delta['unhealthy_volte'].apply(lambda v: f"{v:+,}"),
+            textposition='top center', textfont=dict(size=9)
+        ))
+        fig_health.add_hline(y=0, line_dash='dash', line_color='grey', opacity=0.5)
+        _trend_layout(fig_health, "Daily Change in VoLTE Health (vs Previous Day)", yaxis_title="Change in Subscribers")
+        st.plotly_chart(fig_health, use_container_width=True)
+
+        df_trends['health_pct'] = (
+            df_trends['healthy_volte'] / df_trends['volte_subs'].replace(0, 1) * 100
+        ).round(2)
+
+        fig_hpct = go.Figure()
+        fig_hpct.add_trace(go.Scatter(
+            x=df_trends['CDRtime'], y=df_trends['health_pct'],
+            mode='lines+markers+text',
+            name='Health Rate %',
+            line=dict(color='#27ae60', width=2), marker=dict(size=7),
+            text=df_trends['health_pct'].apply(lambda v: f"{v:.1f}%"),
+            textposition='top center',
+            textfont=dict(size=10)
+        ))
+        fig_hpct.update_layout(yaxis=dict(range=[0, 105]))
+        _trend_layout(fig_hpct, "VoLTE Health Rate % Over Time", yaxis_title="Health Rate (%)")
+        st.plotly_chart(fig_hpct, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── SECTION 4: Summary Table + CSV Export ─────────────────────────────
+        st.subheader("📋 Historical Summary Table")
+        st.markdown("All available UDC days with key metrics. Ordered most-recent-first.")
+
+        df_summary = df_trends[[
+            'CDRtime', 'total_subs', 'volte_subs', 'vowifi_subs',
+            'fiveg_subs', 'healthy_volte', 'unhealthy_volte'
+        ]].copy().sort_values('CDRtime', ascending=False)
+
+        df_summary['volte_pct'] = (
+            df_summary['volte_subs'] / df_summary['total_subs'].replace(0, 1) * 100
+        ).round(2)
+        df_summary['vowifi_pct'] = (
+            df_summary['vowifi_subs'] / df_summary['total_subs'].replace(0, 1) * 100
+        ).round(2)
+        df_summary['fiveg_pct'] = (
+            df_summary['fiveg_subs'] / df_summary['total_subs'].replace(0, 1) * 100
+        ).round(2)
+        df_summary['health_rate_pct'] = (
+            df_summary['healthy_volte'] / df_summary['volte_subs'].replace(0, 1) * 100
+        ).round(2)
+
+        df_summary['CDRtime'] = df_summary['CDRtime'].dt.strftime('%Y-%m-%d')
+
+        df_display = df_summary.rename(columns={
+            'CDRtime': 'Date',
+            'total_subs': 'Total Subs',
+            'volte_subs': 'VoLTE',
+            'vowifi_subs': 'VoWiFi',
+            'fiveg_subs': '5G',
+            'healthy_volte': 'VoLTE Healthy',
+            'unhealthy_volte': 'VoLTE Unhealthy',
+            'volte_pct': 'VoLTE %',
+            'vowifi_pct': 'VoWiFi %',
+            'fiveg_pct': '5G %',
+            'health_rate_pct': 'Health Rate %'
+        })
+
+        st.dataframe(df_display, use_container_width=True)
+
+        csv_export = df_display.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Historical Summary (CSV)",
+            data=csv_export,
+            file_name=f"udc_historical_trends_{date.today().strftime('%Y-%m-%d')}.csv",
+            mime="text/csv",
+            key="hist_trends_csv"
+        )
+
+    elif trends_available and len(df_trends) == 0:
+        st.info(
+            "No historical data found for the last 7 days. "
+            "This can happen when the pipeline has only just started or when the database is being refreshed."
+        )
+
+# ==================== TAB 7: PC/GT AUDIT ====================
+with tab7:
+    render_pcgt_audit_tab()
+
+# ==================== TAB 8: CNACLD EXTRACTOR ====================
+with tab8:
+    render_cnacld_tab()
 
 # Footer
 st.markdown("---")

@@ -59,14 +59,14 @@ fi
 print_success "Docker is available"
 
 # Check Docker Compose
-if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+if ! command -v sudo docker compose &> /dev/null && ! docker compose version &> /dev/null; then
     print_error "Docker Compose is not installed!"
     exit 1
 fi
 print_success "Docker Compose is available"
 
 # Check if images exist
-if docker images | grep -q "telecom-prod-clickhouse"; then
+if sudo docker images | grep -q "telecom-prod-clickhouse"; then
     print_success "Docker images are loaded"
 else
     print_warning "Docker images not found!"
@@ -115,18 +115,18 @@ print_step "Step 3: Deploying Services"
 
 # Stop any existing services
 echo "Stopping any existing services..."
-docker-compose -f docker-compose-production.yml down 2>/dev/null || true
+sudo docker compose -f docker-compose-production.yml down 2>/dev/null || true
 
 # Start ClickHouse
 echo ""
 echo "Starting ClickHouse..."
-docker-compose -f docker-compose-production.yml up -d telecom_prod_clickhouse
+sudo docker compose -f docker-compose-production.yml up -d telecom_prod_clickhouse
 
 # Wait for ClickHouse to be healthy
 echo "Waiting for ClickHouse to be ready..."
 max_wait=60
 waited=0
-while ! docker exec telecom-prod-clickhouse clickhouse-client --query "SELECT 1" &>/dev/null; do
+while ! sudo docker exec telecom-prod-clickhouse clickhouse-client --query "SELECT 1" &>/dev/null; do
     sleep 2
     waited=$((waited + 2))
     if [ $waited -ge $max_wait ]; then
@@ -140,7 +140,7 @@ print_success "ClickHouse is ready!"
 # Start Streamlit
 echo ""
 echo "Starting Streamlit Dashboard..."
-docker-compose -f docker-compose-production.yml up -d telecom_prod_streamlit_app
+sudo docker compose -f docker-compose-production.yml up -d telecom_prod_streamlit_app
 
 # Wait for Streamlit to be healthy
 echo "Waiting for Streamlit to be ready..."
@@ -166,7 +166,7 @@ echo "Creating database tables (MNP, dump_materialized, etc.)..."
 
 # Run init_lakehouse.sql BEFORE Spark processor so MNP tables exist
 if [ -f "$PROJECT_ROOT/clickhouse/init_lakehouse.sql" ]; then
-    docker exec -i telecom-prod-clickhouse clickhouse-client --multiquery < "$PROJECT_ROOT/clickhouse/init_lakehouse.sql" 2>&1 | head -10 || true
+    sudo docker exec -i telecom-prod-clickhouse clickhouse-client --multiquery < "$PROJECT_ROOT/clickhouse/init_lakehouse.sql" 2>&1 | head -10 || true
     print_success "Database schema initialized"
 else
     print_warning "init_lakehouse.sql not found!"
@@ -200,7 +200,7 @@ if [ "$(ls -A wldif/*.ldif* 2>/dev/null)" ]; then
 
     # Run processor
     echo "Running Spark processor..."
-    docker-compose -f docker-compose-production.yml --profile processor run --rm telecom_prod_spark_processor
+    sudo docker compose -f docker-compose-production.yml --profile processor run --rm telecom_prod_spark_processor
 
     print_success "Data processing complete!"
 else
@@ -220,7 +220,7 @@ if [ -f "$PROJECT_ROOT/clickhouse/sync_incremental.sql" ]; then
     echo "Syncing data to materialized MergeTree table..."
     echo "(This handles both initial load and incremental updates)"
     echo ""
-    docker exec -i telecom-prod-clickhouse clickhouse-client --multiquery < "$PROJECT_ROOT/clickhouse/sync_incremental.sql" 2>&1 | grep -E "(status|metric|Sync completed|rows|final_status)" || true
+    sudo docker exec -i telecom-prod-clickhouse clickhouse-client --multiquery < "$PROJECT_ROOT/clickhouse/sync_incremental.sql" 2>&1 | grep -E "(status|metric|Sync completed|rows|final_status)" || true
     print_success "Data sync completed"
 
     # Verify
@@ -251,11 +251,11 @@ echo ""
 echo "Data Statistics:"
 echo ""
 echo "UDC Records:"
-docker exec telecom-prod-clickhouse clickhouse-client --query \
+sudo docker exec telecom-prod-clickhouse clickhouse-client --query \
     "SELECT COUNT(*) as total, COUNT(DISTINCT MSISDN) as subscribers FROM default.dump" 2>/dev/null || echo "  (no data)"
 echo ""
 echo "MNP Records:"
-docker exec telecom-prod-clickhouse clickhouse-client --query \
+sudo docker exec telecom-prod-clickhouse clickhouse-client --query \
     "SELECT COUNT(*) as total, COUNT(DISTINCT Date) as dates FROM default.MNP_details" 2>/dev/null || echo "  (no data)"
 
 #===================================================================================

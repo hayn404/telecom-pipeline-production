@@ -7,9 +7,9 @@
 #   - MSISDNs with inconsistent NAPTR patterns across files
 #
 # Data Strategy:
-#   - IPW Data: REPLACE weekly (no accumulation, always fresh)
+#   - IPW Data: REPLACE on every run (truncate then insert latest sync only)
 #
-# Schedule: Every Friday at 11:00 AM (cron: 0 11 * * 5)
+# Schedule: Weekly (e.g. cron: 0 6 * * 1)
 #===============================================================================
 
 set -e  # Exit on any error
@@ -73,37 +73,11 @@ log_error() {
 }
 
 #-------------------------------------------------------------------------------
-# STEP 1: CHECK PREREQUISITES
-#-------------------------------------------------------------------------------
-check_prerequisites() {
-    log_step "STEP 1: Checking Prerequisites"
-
-    if ! command -v sshpass &> /dev/null; then
-        log_error "sshpass is not installed! Run: apt-get install sshpass"
-        exit 1
-    fi
-    log_success "sshpass is available"
-
-    if ! command -v docker &> /dev/null; then
-        log_error "Docker is not installed!"
-        exit 1
-    fi
-    log_success "Docker is available"
-
-    if ! docker ps | grep -q "${CLICKHOUSE_CONTAINER}"; then
-        log_error "ClickHouse container '${CLICKHOUSE_CONTAINER}' is not running!"
-        log_error "Start it with: docker-compose -f ${DOCKER_COMPOSE_FILE} up -d telecom_prod_clickhouse"
-        exit 1
-    fi
-    log_success "ClickHouse container is running"
-}
-
-#-------------------------------------------------------------------------------
 # STEP 2: CREATE DIRECTORIES
 #-------------------------------------------------------------------------------
 create_directories() {
     log_step "STEP 2: Creating Directories"
-    mkdir -p "${IPW_DIR}" "${PARQUET_DIR}" "${LOG_DIR}"
+    sudo mkdir -p "${IPW_DIR}" "${PARQUET_DIR}" "${LOG_DIR}"
     log_success "Directories ready"
     log "  IPW raw files : ${IPW_DIR}"
     log "  Parquet output: ${PARQUET_DIR}/ipw_data"
@@ -111,7 +85,7 @@ create_directories() {
 }
 
 #-------------------------------------------------------------------------------
-# STEP 3: CLEAN OLD LOCAL IPW FILES (no accumulation — weekly fresh replace)
+# STEP 3: CLEAN OLD LOCAL IPW FILES (weekly fresh download)
 #-------------------------------------------------------------------------------
 clean_old_ipw_files() {
     log_step "STEP 3: Cleaning Old Local IPW Files"
@@ -121,7 +95,7 @@ clean_old_ipw_files() {
 
     if [ "$count" -gt 0 ]; then
         log "Removing ${count} old IPW file(s) from ${IPW_DIR}..."
-        rm -f "${IPW_DIR}"/*.txt
+        sudo rm -f "${IPW_DIR}"/*.txt
         log_success "Old IPW files removed"
     else
         log "No old IPW files to remove"
@@ -136,23 +110,11 @@ clean_old_ipw_files() {
 download_ipw_files() {
     log_step "STEP 4: Downloading IPW Files from ${REMOTE_HOST}:${REMOTE_IPW_PATH}"
 
-    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no \
-        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*PIPW.txt" \
-        "${IPW_DIR}/" 2>/dev/null \
-        && log_success "PIPW file downloaded" \
-        || log_warning "No PIPW file found on server"
+    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*PIPW.txt"         "${IPW_DIR}/" 2>/dev/null         && log_success "PIPW file downloaded"         || log_warning "No PIPW file found on server"
 
-    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no \
-        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*R1IPW.txt" \
-        "${IPW_DIR}/" 2>/dev/null \
-        && log_success "R1IPW file downloaded" \
-        || log_warning "No R1IPW file found on server"
+    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*RIPW.txt"         "${IPW_DIR}/" 2>/dev/null         && log_success "RIPW file downloaded"         || log_warning "No RIPW file found on server"
 
-    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no \
-        "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*YIPW.txt" \
-        "${IPW_DIR}/" 2>/dev/null \
-        && log_success "YIPW file downloaded" \
-        || log_warning "No YIPW file found on server"
+    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*YIPW.txt"         "${IPW_DIR}/" 2>/dev/null         && log_success "YIPW file downloaded"         || log_warning "No YIPW file found on server"
 
     # Abort if no files downloaded
     local downloaded
@@ -168,17 +130,18 @@ download_ipw_files() {
 }
 
 #-------------------------------------------------------------------------------
-# STEP 5: CLEAN OLD IPW PARQUET (weekly replace, no accumulation)
+# STEP 5: CLEAN ALL OLD IPW PARQUET (full wipe before fresh write)
+# Only the latest sync is kept — no historical accumulation
 #-------------------------------------------------------------------------------
 clean_old_parquet() {
-    log_step "STEP 5: Cleaning Old IPW Parquet Data"
+    log_step "STEP 5: Cleaning Old IPW Parquet Data (full wipe)"
 
     if [ -d "${PARQUET_DIR}/ipw_data" ]; then
-        log "Removing old IPW parquet directory: ${PARQUET_DIR}/ipw_data"
-        rm -rf "${PARQUET_DIR}/ipw_data"
+        log "Removing all previous IPW parquet partitions..."
+        sudo rm -rf "${PARQUET_DIR}/ipw_data"
         log_success "Old IPW parquet removed"
     else
-        log "No old IPW parquet to remove"
+        log "No IPW parquet directory to clean"
     fi
 }
 
@@ -194,15 +157,7 @@ run_ipw_processor() {
 
     log "Running processor_ipw.py in Docker..."
 
-    PROCESS_DATE="${TODAY_DASH}" \
-    docker-compose -f "${DOCKER_COMPOSE_FILE}" \
-        --profile processor run --rm \
-        -e PROCESS_DATE="${TODAY_DASH}" \
-        -e IPW_DIR="/ipw_audit" \
-        -e PARQUET_DIR="/data/parquet" \
-        telecom_prod_spark_processor \
-        python processor_ipw.py \
-        2>&1 | tee -a "${LOG_FILE}"
+    PROCESS_DATE="${TODAY_DASH}"     sudo docker compose -f "${DOCKER_COMPOSE_FILE}"         --profile processor run --rm         -e PROCESS_DATE="${TODAY_DASH}"         -e IPW_DIR="/ipw_audit"         -e PARQUET_DIR="/data/parquet"         telecom_prod_spark_processor         python processor_ipw.py         2>&1 | tee -a "${LOG_FILE}"
 
     log_success "IPW Parquet processing complete"
     log "Output: ${PARQUET_DIR}/ipw_data/process_date=${TODAY_DASH}/"
@@ -210,25 +165,24 @@ run_ipw_processor() {
 
 #-------------------------------------------------------------------------------
 # STEP 7: SYNC IPW PARQUET → CLICKHOUSE
+# INSERT only (no TRUNCATE) — ReplacingMergeTree handles deduplication
 #-------------------------------------------------------------------------------
 sync_to_clickhouse() {
     log_step "STEP 7: Syncing IPW Parquet Data to ClickHouse"
 
-    log "Running ipw_sync.sql (TRUNCATE + INSERT from Parquet)..."
-    docker exec -i "${CLICKHOUSE_CONTAINER}" clickhouse-client --multiquery \
-        < "${PROJECT_DIR}/clickhouse/ipw_sync.sql" \
-        2>&1 | tee -a "${LOG_FILE}"
+    log "Running ipw_sync.sql (INSERT from Parquet, no TRUNCATE)..."
+    sudo docker exec -i "${CLICKHOUSE_CONTAINER}" clickhouse-client --multiquery         < "${PROJECT_DIR}/clickhouse/ipw_sync.sql"         2>&1 | tee -a "${LOG_FILE}"
 
     log_success "ClickHouse sync complete"
 }
 
 #-------------------------------------------------------------------------------
-# STEP 8: STATUS — Show reconciliation summary
+# STEP 8: STATUS — Show reconciliation summary for the latest sync date
 #-------------------------------------------------------------------------------
 show_status() {
     log_step "STEP 8: Reconciliation Summary"
 
-    docker exec "${CLICKHOUSE_CONTAINER}" clickhouse-client --query="
+    sudo docker exec "${CLICKHOUSE_CONTAINER}" clickhouse-client --query="
         SELECT
             process_date,
             countIf(status = 'OK')               AS consistent,
@@ -238,10 +192,8 @@ show_status() {
         FROM default.ipw_reconciliation
         GROUP BY process_date
         ORDER BY process_date DESC
-        LIMIT 1
         FORMAT Pretty
-    " 2>/dev/null | tee -a "${LOG_FILE}" \
-        || log_warning "Could not read reconciliation view — check ClickHouse schema"
+    " 2>/dev/null | tee -a "${LOG_FILE}"         || log_warning "Could not read reconciliation view — check ClickHouse schema"
 }
 
 #-------------------------------------------------------------------------------
@@ -255,13 +207,12 @@ main() {
 
     START_TIME=$(date +%s)
 
-    check_prerequisites
     create_directories
     clean_old_ipw_files      # Remove stale local files
     download_ipw_files       # Fresh download from FTP server
-    clean_old_parquet        # Remove stale parquet
+    clean_old_parquet        # Wipe all previous IPW parquet before fresh write
     run_ipw_processor        # IPW txt → Parquet (chunked)
-    sync_to_clickhouse       # Parquet → ClickHouse ipw_raw
+    sync_to_clickhouse       # TRUNCATE ipw_raw then INSERT fresh data
     show_status              # Print reconciliation summary
 
     END_TIME=$(date +%s)
