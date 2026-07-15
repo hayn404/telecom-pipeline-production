@@ -67,6 +67,7 @@ SELECT
     CAST(CFNRCTS10FNUM AS Nullable(String)) AS CFNRCTS10FNUM,
     CAST(CFNRYTS10FNUM AS Nullable(String)) AS CFNRYTS10FNUM,
     CAST(DCFTS10FNUM AS Nullable(String)) AS DCFTS10FNUM,
+    CAST(SCHAR AS Nullable(String)) AS SCHAR,
     CAST(source_file AS Nullable(String)) AS source_file,
     CAST(processing_time AS Nullable(DateTime)) AS processing_time
 FROM file('/var/lib/clickhouse/user_files/parquet/telecom_data/**/*.parquet', 'Parquet')
@@ -136,6 +137,7 @@ CREATE TABLE IF NOT EXISTS default.dump_materialized
     CFNRCTS10FNUM String DEFAULT '',
     CFNRYTS10FNUM String DEFAULT '',
     DCFTS10FNUM String DEFAULT '',
+    SCHAR String DEFAULT '',
     source_file String DEFAULT '',
     processing_time DateTime DEFAULT now()
 )
@@ -143,6 +145,9 @@ ENGINE = MergeTree()
 PARTITION BY toYYYYMM(CDRtime)
 ORDER BY (CDRtime, MSISDN, IMSI)
 SETTINGS index_granularity = 8192;
+
+ALTER TABLE default.dump_materialized
+ADD COLUMN IF NOT EXISTS SCHAR String DEFAULT '';
 
 -- ============================================================================
 -- STEP 3: ADD BLOOM FILTER INDEXES - Super fast MSISDN/IMSI lookups

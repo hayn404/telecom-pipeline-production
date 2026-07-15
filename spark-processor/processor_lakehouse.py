@@ -65,12 +65,31 @@ SELECTED_ATTRS = [
     'CFNRCTS10FNUM', # Call Forward No Reply (CFNRC) destination
     'CFNRYTS10FNUM', # Call Forward No Reply 2 (CFNRY) destination
     'DCFTS10FNUM',   # Default Call Forward (DCF) destination
+    'SCHAR',
 ]
 
 # Attributes that are base64-encoded MSISDNs and need special decoding
 FORWARDING_NUMBER_ATTRS = {
     'CFUT10FNUM', 'CFBTS10FNUM', 'CFNRCTS10FNUM', 'CFNRYTS10FNUM', 'DCFTS10FNUM'
 }
+
+# new set, parallel to FORWARDING_NUMBER_ATTRS
+LITTLE_ENDIAN_INT_ATTRS = {'SCHAR'}
+
+def decode_little_endian_int(raw_value: str) -> str:
+    """Decode a base64 LDIF value (e.g. SCHAR:: AgA=) as a little-endian int."""
+    try:
+        b64_str = raw_value.strip()
+        if b64_str.startswith(': '):
+            b64_str = b64_str[2:].strip()
+        elif b64_str.startswith(':'):
+            b64_str = b64_str[1:].strip()
+        if not b64_str:
+            return None
+        decoded_bytes = base64.b64decode(b64_str)
+        return str(int.from_bytes(decoded_bytes, byteorder='little'))
+    except Exception:
+        return None
 
 
 def decode_forwarding_number(raw_value: str) -> str:
@@ -268,6 +287,8 @@ def process_entries_chunk(entries: List[Dict], source_file: str, cdr_date: str) 
                     if value and attr in FORWARDING_NUMBER_ATTRS:
                         # Decode base64-encoded MSISDN forwarding number
                         record[attr] = decode_forwarding_number(str(value))
+                    elif value and attr in LITTLE_ENDIAN_INT_ATTRS:
+                        record[attr] = decode_little_endian_int(str(value))
                     else:
                         # Convert to string if value exists, otherwise None
                         record[attr] = str(value) if value else None

@@ -38,7 +38,7 @@ INSERT INTO default.dump_materialized
      ImsLastActivityDate, ImsRoamAllow, ImsBarrInd, COLP, SOCOLP,
      EpsIndDefContextId, EpsIndMappingContextId, EpsProfileId,
      EpsUserIpV4Address, IMPI, source_file, processing_time,
-     CFUT10FNUM, CFBTS10FNUM, CFNRCTS10FNUM, CFNRYTS10FNUM, DCFTS10FNUM)
+     CFUT10FNUM, CFBTS10FNUM, CFNRCTS10FNUM, CFNRYTS10FNUM, DCFTS10FNUM, SCHAR)
 SELECT
     coalesce(mscid, '') AS mscid,
     CDRtime,
@@ -94,7 +94,8 @@ SELECT
     coalesce(CFBTS10FNUM, '') AS CFBTS10FNUM,
     coalesce(CFNRCTS10FNUM, '') AS CFNRCTS10FNUM,
     coalesce(CFNRYTS10FNUM, '') AS CFNRYTS10FNUM,
-    coalesce(DCFTS10FNUM, '') AS DCFTS10FNUM
+    coalesce(DCFTS10FNUM, '') AS DCFTS10FNUM,
+    coalesce(SCHAR, '') AS SCHAR
 FROM default.dump_source;
 
 -- Step 4: Optimize the table (merge parts and rebuild indexes)
