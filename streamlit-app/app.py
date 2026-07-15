@@ -919,6 +919,33 @@ with tab1:
 
     st.markdown("---")
 
+    st.subheader("SCHAR Distribution")
+
+    schar_query = f"""
+        SELECT
+            CASE SCHAR
+                WHEN '2' THEN 'Data SIM'
+                WHEN '0' THEN 'Mobile Internet'
+                WHEN '5' THEN 'Kidzo1'
+                WHEN '6' THEN 'Kidzo2'
+                ELSE 'Other'
+            END AS SCHARType,
+            uniqExact(MSISDN) AS Subscribers
+        FROM default.dump
+        WHERE CDRtime = '{cdr_date_str_dash}'
+        AND SCHAR IS NOT NULL AND SCHAR != ''
+        GROUP BY SCHARType
+        ORDER BY Subscribers DESC
+    """
+    rows, _ = run_cached_query_with_disk(schar_query, cdr_date_str, "schar_distribution")
+    df_schar = pd.DataFrame(rows, columns=['Type', 'Subscribers'])
+
+    fig = px.pie(df_schar, values='Subscribers', names='Type',
+                title="Subscribers by SCHAR Type")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
     # ==================== DATA SIMs STATISTICS SECTION ====================
     st.subheader("📶 Data SIMs Statistics")
     st.markdown("*Data SIMs: Subscribers with PDPCP or EpsUserIpV4Address (APN) but without TICK (no voice service)*")
