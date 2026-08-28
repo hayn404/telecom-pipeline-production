@@ -129,11 +129,11 @@ LEFT JOIN (
     SELECT
         msisdn,
         multiIf(
-            NOT (countIf(source_file = 'PIPW')  > 0
-                 AND countIf(source_file = 'RIPW') > 0
+            NOT (countIf(source_file = 'SIPW')  > 0
+                 AND countIf(source_file = 'KIPW') > 0
                  AND countIf(source_file = 'YIPW')  > 0), 'MISSING',
-            maxIf(naptrTxt, source_file = 'PIPW') != maxIf(naptrTxt, source_file = 'RIPW') OR
-            maxIf(naptrTxt, source_file = 'PIPW') != maxIf(naptrTxt, source_file = 'YIPW'),
+            maxIf(naptrTxt, source_file = 'SIPW') != maxIf(naptrTxt, source_file = 'KIPW') OR
+            maxIf(naptrTxt, source_file = 'SIPW') != maxIf(naptrTxt, source_file = 'YIPW'),
             'PATTERN_MISMATCH',
             'OK'
         ) AS status

@@ -2,7 +2,7 @@
 #===============================================================================
 # IPW Audit Pipeline - Weekly VoLTE Reconciliation
 #
-# Compares 3 IMS node files (PIPW, R1IPW, YIPW) to detect:
+# Compares 3 IMS node files (SIPW, KIPW, YIPW) to detect:
 #   - MSISDNs missing from one or more files
 #   - MSISDNs with inconsistent NAPTR patterns across files
 #
@@ -105,14 +105,14 @@ clean_old_ipw_files() {
 #-------------------------------------------------------------------------------
 # STEP 4: DOWNLOAD IPW FILES FROM REMOTE SERVER
 # Uses same sshpass + scp pattern as daily_pipeline.sh
-# Wildcards (*PIPW.txt etc.) handle weekly prefix rotation (test2_, test3_, ...)
+# Wildcards (*SIPW.txt etc.) handle weekly prefix rotation (test2_, test3_, ...)
 #-------------------------------------------------------------------------------
 download_ipw_files() {
     log_step "STEP 4: Downloading IPW Files from ${REMOTE_HOST}:${REMOTE_IPW_PATH}"
 
-    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*PIPW.txt"         "${IPW_DIR}/" 2>/dev/null         && log_success "PIPW file downloaded"         || log_warning "No PIPW file found on server"
+    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*SIPW.txt"         "${IPW_DIR}/" 2>/dev/null         && log_success "SIPW file downloaded"         || log_warning "No SIPW file found on server"
 
-    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*RIPW.txt"         "${IPW_DIR}/" 2>/dev/null         && log_success "RIPW file downloaded"         || log_warning "No RIPW file found on server"
+    sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*KIPW.txt"         "${IPW_DIR}/" 2>/dev/null         && log_success "KIPW file downloaded"         || log_warning "No KIPW file found on server"
 
     sshpass -p "${REMOTE_PASSWORD}" scp -o StrictHostKeyChecking=no         "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_IPW_PATH}/*YIPW.txt"         "${IPW_DIR}/" 2>/dev/null         && log_success "YIPW file downloaded"         || log_warning "No YIPW file found on server"
 

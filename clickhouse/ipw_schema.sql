@@ -1,6 +1,6 @@
 -- ============================================================================
 -- IPW Audit Schema
--- VoLTE MSISDN reconciliation across PIPW, RIPW, YIPW IMS nodes
+-- VoLTE MSISDN reconciliation across SIPW, KIPW, YIPW IMS nodes
 --
 -- USAGE (run once to initialise):
 --   docker exec telecom-prod-clickhouse clickhouse-client --multiquery < ipw_schema.sql
@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS default.ipw_raw
     process_date Date,
     msisdn       String,
     naptrTxt     String,
-    source_file  LowCardinality(String)   -- 'PIPW', 'R1IPW', 'YIPW'
+    source_file  LowCardinality(String)   -- 'SIPW', 'KIPW', 'YIPW'
 )
 ENGINE = ReplacingMergeTree()
 PARTITION BY toYYYYMM(process_date)
@@ -74,26 +74,26 @@ SELECT
     process_date,
 
     -- Pattern seen in each file (empty string if absent)
-    maxIf(naptrTxt, source_file = 'PIPW')   AS pipw_pattern,
-    maxIf(naptrTxt, source_file = 'RIPW')  AS ripw_pattern,
+    maxIf(naptrTxt, source_file = 'SIPW')   AS sipw_pattern,
+    maxIf(naptrTxt, source_file = 'KIPW')  AS kipw_pattern,
     maxIf(naptrTxt, source_file = 'YIPW')   AS yipw_pattern,
 
     -- Presence flags (1 = present, 0 = absent)
-    countIf(source_file = 'PIPW')  > 0      AS in_pipw,
-    countIf(source_file = 'RIPW') > 0      AS in_ripw,
+    countIf(source_file = 'SIPW')  > 0      AS in_sipw,
+    countIf(source_file = 'KIPW') > 0      AS in_kipw,
     countIf(source_file = 'YIPW')  > 0      AS in_yipw,
 
     -- Status classification
     multiIf(
         -- Not in all 3 files
         NOT (
-            countIf(source_file = 'PIPW')  > 0 AND
-            countIf(source_file = 'RIPW') > 0 AND
+            countIf(source_file = 'SIPW')  > 0 AND
+            countIf(source_file = 'KIPW') > 0 AND
             countIf(source_file = 'YIPW')  > 0
         ), 'MISSING',
         -- In all 3 but patterns differ
-        maxIf(naptrTxt, source_file = 'PIPW') != maxIf(naptrTxt, source_file = 'RIPW') OR
-        maxIf(naptrTxt, source_file = 'PIPW') != maxIf(naptrTxt, source_file = 'YIPW'),
+        maxIf(naptrTxt, source_file = 'SIPW') != maxIf(naptrTxt, source_file = 'KIPW') OR
+        maxIf(naptrTxt, source_file = 'SIPW') != maxIf(naptrTxt, source_file = 'YIPW'),
         'PATTERN_MISMATCH',
         -- All good
         'OK'
@@ -102,27 +102,27 @@ SELECT
     -- Human-readable description of which files are missing
     multiIf(
         -- Missing from all 3
-        NOT (countIf(source_file = 'PIPW')  > 0) AND
-        NOT (countIf(source_file = 'RIPW') > 0) AND
+        NOT (countIf(source_file = 'SIPW')  > 0) AND
+        NOT (countIf(source_file = 'KIPW') > 0) AND
         NOT (countIf(source_file = 'YIPW')  > 0),
             'Missing from all 3',
 
         -- Missing from 2 files
-        NOT (countIf(source_file = 'PIPW')  > 0) AND
-        NOT (countIf(source_file = 'RIPW') > 0),
-            'Missing from PIPW, RIPW',
+        NOT (countIf(source_file = 'SIPW')  > 0) AND
+        NOT (countIf(source_file = 'KIPW') > 0),
+            'Missing from SIPW, KIPW',
 
-        NOT (countIf(source_file = 'PIPW')  > 0) AND
+        NOT (countIf(source_file = 'SIPW')  > 0) AND
         NOT (countIf(source_file = 'YIPW')  > 0),
-            'Missing from PIPW, YIPW',
+            'Missing from SIPW, YIPW',
 
-        NOT (countIf(source_file = 'RIPW') > 0) AND
+        NOT (countIf(source_file = 'KIPW') > 0) AND
         NOT (countIf(source_file = 'YIPW')  > 0),
-            'Missing from RIPW, YIPW',
+            'Missing from KIPW, YIPW',
 
         -- Missing from exactly 1 file
-        NOT (countIf(source_file = 'PIPW')  > 0), 'Missing from PIPW',
-        NOT (countIf(source_file = 'RIPW') > 0), 'Missing from RIPW',
+        NOT (countIf(source_file = 'SIPW')  > 0), 'Missing from SIPW',
+        NOT (countIf(source_file = 'KIPW') > 0), 'Missing from KIPW',
         NOT (countIf(source_file = 'YIPW')  > 0), 'Missing from YIPW',
 
         -- Not missing (consistent or mismatch)

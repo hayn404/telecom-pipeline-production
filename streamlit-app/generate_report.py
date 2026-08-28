@@ -10,14 +10,14 @@ Output: /app/reports/eand_core_stats_YYYY-MM-DD.xlsx  (one file per day)
 
 Behaviour:
 - Generates today's file on every run (data may have been refreshed).
-- Skips files for past dates that already exist (past data is immutable).
+- Regenerates past-date files if ClickHouse data was updated since last export.
 - Auto-deletes files older than KEEP_DAYS (default 15).
 """
 
 import io
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import clickhouse_connect
@@ -506,10 +506,23 @@ def main():
     for date_str in available_dates:
         output_path = REPORTS_DIR / f"eand_core_stats_{date_str}.xlsx"
 
-        # Skip past dates that already have a file (data is immutable once loaded)
+        # Skip past dates only if file is newer than the data's last modification
         if output_path.exists() and date_str != today_str:
-            print(f"[SKIP] {date_str} — file exists, skipping")
-            continue
+            try:
+                mod_rows = client.command(
+                    "SELECT max(modification_time) FROM system.parts "
+                    "WHERE database = 'default' AND table = 'dump' AND active"
+                )
+                db_modified = mod_rows if isinstance(mod_rows, datetime) else None
+                file_modified = datetime.fromtimestamp(output_path.stat().st_mtime)
+                if db_modified and file_modified >= db_modified:
+                    print(f"[SKIP] {date_str} — file exists and is up to date, skipping")
+                    continue
+                else:
+                    print(f"[REGEN] {date_str} — data updated since last export, regenerating")
+            except Exception:
+                print(f"[SKIP] {date_str} — file exists, skipping (staleness check failed)")
+                continue
 
         print(f"[GEN]  {date_str} — querying ClickHouse...")
         try:

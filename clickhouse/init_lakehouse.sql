@@ -70,7 +70,9 @@ SELECT
     CAST(SCHAR AS Nullable(String)) AS SCHAR,
     CAST(source_file AS Nullable(String)) AS source_file,
     CAST(processing_time AS Nullable(DateTime)) AS processing_time
-FROM file('/var/lib/clickhouse/user_files/parquet/telecom_data/**/*.parquet', 'Parquet')
+FROM file('/var/lib/clickhouse/user_files/parquet/telecom_data/**/*.parquet', 'Parquet',
+    'mscid Nullable(String), CDRtime Nullable(Date), MSISDN Nullable(String), IMSI Nullable(String), CSP Nullable(String), CSLOC Nullable(String), VLRADD Nullable(String), PDPCP Nullable(String), TICK Nullable(String), OBO Nullable(String), OBI Nullable(String), OBR Nullable(String), TS11 Nullable(String), TS21 Nullable(String), TS22 Nullable(String), PRBT Nullable(String), NAM Nullable(String), DCF Nullable(String), CAW Nullable(String), HOLD Nullable(String), CFB Nullable(String), CFNRC Nullable(String), CFNRY Nullable(String), CFU Nullable(String), CLIR Nullable(String), SOCLIR Nullable(String), SOCLIP Nullable(String), CLIP Nullable(String), CAT Nullable(String), EpsImeiSv Nullable(String), EpsLastUpdateLocationDate Nullable(String), EpsLastActivityDate Nullable(String), EpsAccessRestriction Nullable(String), EpsStnSr Nullable(String), EpsAutomaticProvisioned Nullable(String), EpsRoamAllow Nullable(String), EpsRoamRestrict Nullable(String), EpsRoamingServiceAreaId Nullable(String), ImsLastActivityDate Nullable(String), ImsRoamAllow Nullable(String), ImsBarrInd Nullable(String), COLP Nullable(String), SOCOLP Nullable(String), EpsIndDefContextId Nullable(String), EpsIndMappingContextId Nullable(String), EpsProfileId Nullable(String), EpsUserIpV4Address Nullable(String), IMPI Nullable(String), CFUT10FNUM Nullable(String), CFBTS10FNUM Nullable(String), CFNRCTS10FNUM Nullable(String), CFNRYTS10FNUM Nullable(String), DCFTS10FNUM Nullable(String), SCHAR Nullable(String), source_file Nullable(String), processing_time Nullable(DateTime)'
+)
 WHERE _path NOT LIKE '%_temporary%'
 SETTINGS
     input_format_parquet_import_nested = 1,

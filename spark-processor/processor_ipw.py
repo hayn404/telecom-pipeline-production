@@ -2,7 +2,7 @@
 """
 IPW Audit Processor - Tab-Separated Files to Parquet
 
-Processes 3 IMS node IPW files (PIPW, RIPW, YIPW) into a unified Parquet
+Processes 3 IMS node IPW files (SIPW, KIPW, YIPW) into a unified Parquet
 data lake for ClickHouse reconciliation queries.
 
 File format (tab-separated, with header):
@@ -49,8 +49,8 @@ CHUNK_SIZE   = int(os.getenv('CHUNK_SIZE', '500000'))  # rows per chunk
 
 # Map: source label → glob pattern to find the file
 FILE_PATTERNS = {
-    'PIPW':  '*PIPW.txt',
-    'RIPW': '*RIPW.txt',
+    'SIPW':  '*SIPW.txt',
+    'KIPW': '*KIPW.txt',
     'YIPW':  '*YIPW.txt',
 }
 

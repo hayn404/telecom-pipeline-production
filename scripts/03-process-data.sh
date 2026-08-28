@@ -117,6 +117,20 @@ else
 fi
 echo ""
 
+# Clear dashboard disk cache for the processed date — reprocessed data makes
+# cached results stale (see run_cached_query_with_disk in streamlit-app/app.py)
+echo "============================================"
+echo "Step 4: Clearing Dashboard Cache for ${CDR_DATE}"
+echo "============================================"
+if sudo docker ps --format '{{.Names}}' | grep -q '^telecom-prod-streamlit-app$'; then
+    sudo docker exec telecom-prod-streamlit-app rm -rf "/app/cache/${CDR_DATE}" \
+        && echo "Dashboard cache cleared for ${CDR_DATE}" \
+        || echo "Warning: failed to clear dashboard cache (non-fatal)"
+else
+    echo "Streamlit container not running - skipping cache clear"
+fi
+echo ""
+
 # Show Parquet files
 if [ -d "data/parquet/telecom_data" ]; then
     echo "Parquet files created:"

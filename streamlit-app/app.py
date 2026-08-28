@@ -2413,7 +2413,8 @@ SELECT
 
     countIf(
         d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
-        AND d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586')
+        AND (d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586')
+             OR d.EpsIndMappingContextId IS NULL)
     ) AS wrong_apn,
 
     countIf(
@@ -2422,16 +2423,31 @@ SELECT
         AND (d.IMPI = '' OR d.IMPI IS NULL)
     ) AS missing_impi,
 
-    countIf(ipw.msisdn IS NULL) AS not_in_ipw,
-    countIf(ipw.status = 'MISSING') AS ipw_missing_node,
-    countIf(ipw.status = 'PATTERN_MISMATCH') AS ipw_mismatch
+    countIf(
+        d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+        AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+        AND d.IMPI != '' AND d.IMPI IS NOT NULL
+        AND ipw.msisdn IS NULL
+    ) AS not_in_ipw,
+    countIf(
+        d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+        AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+        AND d.IMPI != '' AND d.IMPI IS NOT NULL
+        AND ipw.status = 'MISSING'
+    ) AS ipw_missing_node,
+    countIf(
+        d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+        AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+        AND d.IMPI != '' AND d.IMPI IS NOT NULL
+        AND ipw.status = 'PATTERN_MISMATCH'
+    ) AS ipw_mismatch
 
 FROM
 (
     SELECT *
     FROM default.dump
-    WHERE CDRtime = '{date}'
-      AND TICK = 215
+    WHERE CDRtime = '{cdr_date_str_dash}'
+      AND TICK = '215'
 ) d
 
 LEFT JOIN
@@ -2604,10 +2620,10 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                 lk_rows, _ = run_cached_query(f"""
                     SELECT
                         msisdn, process_date,
-                        if(in_pipw,  'Present', 'Missing') AS PIPW,
-                        if(in_ripw, 'Present', 'Missing') AS RIPW,
+                        if(in_sipw,  'Present', 'Missing') AS SIPW,
+                        if(in_kipw, 'Present', 'Missing') AS KIPW,
                         if(in_yipw,  'Present', 'Missing') AS YIPW,
-                        status, pipw_pattern, ripw_pattern, yipw_pattern
+                        status, sipw_pattern, kipw_pattern, yipw_pattern
                     FROM default.ipw_reconciliation
                     WHERE msisdn = '{lookup_msisdn}'
                     LIMIT 1
@@ -2617,13 +2633,13 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                     status_val = r[5]
                     st.markdown(f"**IPW Status:** `{status_val}`")
                     c1, c2, c3 = st.columns(3)
-                    c1.metric("PIPW",  r[2])
-                    c2.metric("RIPW", r[3])
+                    c1.metric("SIPW",  r[2])
+                    c2.metric("KIPW", r[3])
                     c3.metric("YIPW",  r[4])
                     if status_val == 'PATTERN_MISMATCH':
                         st.markdown("**NAPTR Patterns across nodes:**")
                         st.write(pd.DataFrame({
-                            'Node':    ['PIPW',  'RIPW',  'YIPW'],
+                            'Node':    ['SIPW',  'KIPW',  'YIPW'],
                             'Pattern': [r[6],    r[7],     r[8]]
                         }))
                 else:
@@ -2635,9 +2651,12 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
 
         # ---- Unhealthy VoLTE Subscribers Table ----
         st.subheader("Misconfigured VoLTE Subscribers")
-        st.markdown("All VoLTE users failing **any** health criterion (UDC profile or IPW presence).")
+        st.markdown(
+            "All TICK=215 subscribers failing **any** health criterion — including users with "
+            "no EPS profile — so this list always matches the metrics above."
+        )
 
-        if cnt_unhealthy == 0:
+        if cnt_unhealthy == 0 and cnt_no_profile == 0:
             st.success("All VoLTE subscribers are fully healthy.")
         else:
             # Issue type filter
@@ -2666,13 +2685,14 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
             elif "NAPTR Pattern Mismatch" in issue_filter:
                 issue_where = "AND ipw.status = 'PATTERN_MISMATCH'"
 
-            # For "All Issues" exclude healthy users AND no-profile users (they aren't VoLTE)
+            # "All Issues" = every subscriber failing the full health check,
+            # including No-EPS-Profile users, so the export matches the metrics
             if issue_filter == "All Issues":
-                issue_where = """AND d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
-                AND NOT (
-                    d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
+                issue_where = """AND NOT (
+                    d.EpsProfileId != '' AND d.EpsProfileId IS NOT NULL
+                    AND d.EpsIndMappingContextId IN ('15$2008300586', '15$1008300586')
                     AND d.IMPI != ''
-                    AND ipw.status = 'OK'
+                    AND ifNull(ipw.status, '') = 'OK'
                 )"""
 
             try:
@@ -2683,10 +2703,16 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                         d.EpsProfileId,
                         d.EpsIndMappingContextId,
                         d.IMPI,
+                        multiIf(
+                            d.EpsProfileId = '' OR d.EpsProfileId IS NULL, 'No EPS Profile',
+                            d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586'), 'Wrong APN Mapping',
+                            d.IMPI = '' OR d.IMPI IS NULL, 'No IMS Identity',
+                            '-'
+                        ) AS udc_issue,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_pipw, 'Y', 'N')) AS PIPW,
+                            if(ipw.in_sipw, 'Y', 'N')) AS SIPW,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_ripw, 'Y', 'N')) AS RIPW,
+                            if(ipw.in_kipw, 'Y', 'N')) AS KIPW,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
                             if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
                         multiIf(
@@ -2696,7 +2722,10 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                             'OK'
                         ) AS ipw_status
                     FROM default.dump AS d
-                    LEFT JOIN default.ipw_reconciliation AS ipw ON d.MSISDN = ipw.msisdn
+                    LEFT JOIN (
+                        SELECT * FROM default.ipw_reconciliation
+                        WHERE process_date = (SELECT max(process_date) FROM default.ipw_reconciliation)
+                    ) AS ipw ON d.MSISDN = ipw.msisdn
                     WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
                         {issue_where}
                     ORDER BY d.MSISDN
@@ -2705,7 +2734,7 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                 if misc_rows:
                     df_misc = pd.DataFrame(misc_rows, columns=[
                         'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
-                        'PIPW', 'RIPW', 'YIPW', 'IPW Status'
+                        'UDC Issue', 'SIPW', 'KIPW', 'YIPW', 'IPW Status'
                     ])
                     st.caption(f"Showing first {len(df_misc):,} results")
                     st.dataframe(df_misc, use_container_width=True, height=400)
@@ -2716,10 +2745,16 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                 dl_rows, _ = run_cached_query(f"""
                     SELECT
                         d.MSISDN, d.IMSI, d.EpsProfileId, d.EpsIndMappingContextId, d.IMPI,
+                        multiIf(
+                            d.EpsProfileId = '' OR d.EpsProfileId IS NULL, 'No EPS Profile',
+                            d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586'), 'Wrong APN Mapping',
+                            d.IMPI = '' OR d.IMPI IS NULL, 'No IMS Identity',
+                            '-'
+                        ) AS udc_issue,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_pipw, 'Y', 'N')) AS PIPW,
+                            if(ipw.in_sipw, 'Y', 'N')) AS SIPW,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_ripw, 'Y', 'N')) AS RIPW,
+                            if(ipw.in_kipw, 'Y', 'N')) AS KIPW,
                         if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
                             if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
                         multiIf(
@@ -2729,7 +2764,10 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                             'OK'
                         ) AS ipw_status
                     FROM default.dump AS d
-                    LEFT JOIN default.ipw_reconciliation AS ipw ON d.MSISDN = ipw.msisdn
+                    LEFT JOIN (
+                        SELECT * FROM default.ipw_reconciliation
+                        WHERE process_date = (SELECT max(process_date) FROM default.ipw_reconciliation)
+                    ) AS ipw ON d.MSISDN = ipw.msisdn
                     WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
                         {issue_where}
                     ORDER BY d.MSISDN
@@ -2738,7 +2776,7 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                 if dl_rows:
                     df_dl = pd.DataFrame(dl_rows, columns=[
                         'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
-                        'PIPW', 'RIPW', 'YIPW', 'IPW Status'
+                        'UDC Issue', 'SIPW', 'KIPW', 'YIPW', 'IPW Status'
                     ])
                     st.download_button(
                         label="Download Misconfigured VoLTE Users (CSV)",

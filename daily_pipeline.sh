@@ -259,6 +259,21 @@ sync_udc_data() {
 }
 
 #-------------------------------------------------------------------------------
+# STEP 7b: CLEAR DASHBOARD CACHE (reprocessed data makes cached results stale)
+#-------------------------------------------------------------------------------
+clear_dashboard_cache() {
+    log_step "STEP 7b: Clearing Dashboard Cache for ${TODAY_DASH}"
+
+    if sudo docker ps --format '{{.Names}}' | grep -q '^telecom-prod-streamlit-app$'; then
+        sudo docker exec telecom-prod-streamlit-app rm -rf "/app/cache/${TODAY_DASH}" \
+            && log_success "Dashboard cache cleared for ${TODAY_DASH}" \
+            || log_warning "Failed to clear dashboard cache (non-fatal)"
+    else
+        log_warning "Streamlit container not running - skipping cache clear"
+    fi
+}
+
+#-------------------------------------------------------------------------------
 # STEP 8: GENERATE EXCEL REPORTS (Last 15 days)
 #-------------------------------------------------------------------------------
 generate_excel_reports() {
@@ -338,6 +353,7 @@ main() {
     start_services
     run_processor
     sync_udc_data           # Sync Parquet to ClickHouse
+    clear_dashboard_cache   # Invalidate stale dashboard cache for today
     generate_excel_reports  # Export daily Excel reports to /reports/
     cleanup_old_mnp         # Clean old MNP (keep 30 days)
     show_status
