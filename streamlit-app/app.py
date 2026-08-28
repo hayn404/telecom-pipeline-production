@@ -159,13 +159,16 @@ def set_server_cache(date_str, cache_key, data):
         json.dump(data, f)
 
 def run_cached_query_with_disk(query, date_str, cache_key):
-    """Query with server-side disk cache. Checks disk first, then DB."""
+    """Query with server-side disk cache. Checks disk first, then DB.
+    Cache entries include a hash of the query text so that changes to SQL
+    automatically invalidate stale results."""
+    query_hash = hashlib.md5(query.encode()).hexdigest()
     cached = get_server_cache(date_str, cache_key)
-    if cached is not None:
+    if cached is not None and cached.get('query_hash') == query_hash:
         rows = tuple(tuple(row) for row in cached['rows'])
         columns = tuple(cached['columns'])
         return rows, columns
-    # Not on disk — query DB and save
+    # Not on disk, or query changed — query DB and save
     rows, columns = run_cached_query(query)
     # Serialize: convert date/datetime objects to strings for JSON
     serializable_rows = []
@@ -179,7 +182,8 @@ def run_cached_query_with_disk(query, date_str, cache_key):
         serializable_rows.append(serializable_row)
     set_server_cache(date_str, cache_key, {
         'rows': serializable_rows,
-        'columns': list(columns)
+        'columns': list(columns),
+        'query_hash': query_hash,
     })
     return rows, columns
 
