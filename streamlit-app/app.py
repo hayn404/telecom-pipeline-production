@@ -2477,6 +2477,43 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
     except Exception as e:
         st.error(f"Error loading VoLTE health data: {e}")
 
+    # ---- Reverse check: present in any IPW node file, but NOT TICK=215 in UDC ----
+    # (covers both "TICK != 215" and "MSISDN missing from UDC entirely" that day)
+    cnt_ipw_no_tick215 = 0
+    cnt_drift_sipw = cnt_drift_kipw = cnt_drift_yipw = 0
+    try:
+        rev_rows, _ = run_cached_query_with_disk(f"""
+SELECT
+    count() AS total_drift,
+    countIf(ipw.in_sipw = 1) AS drift_sipw,
+    countIf(ipw.in_kipw = 1) AS drift_kipw,
+    countIf(ipw.in_yipw = 1) AS drift_yipw
+FROM
+(
+    SELECT msisdn, in_sipw, in_kipw, in_yipw
+    FROM default.ipw_reconciliation
+    WHERE process_date = (
+        SELECT max(process_date) FROM default.ipw_reconciliation
+    )
+    AND msisdn LIKE '201%'
+) ipw
+LEFT JOIN
+(
+    SELECT MSISDN, TICK
+    FROM default.dump
+    WHERE CDRtime = '{cdr_date_str_dash}'
+) d
+ON ipw.msisdn = d.MSISDN
+WHERE d.TICK IS NULL OR d.TICK != '215'
+        """, cdr_date_str, "volte_ipw_no_tick215")
+        if rev_rows:
+            cnt_ipw_no_tick215 = int(rev_rows[0][0])
+            cnt_drift_sipw     = int(rev_rows[0][1])
+            cnt_drift_kipw     = int(rev_rows[0][2])
+            cnt_drift_yipw     = int(rev_rows[0][3])
+    except Exception as e:
+        st.error(f"Error loading IPW reverse-check data: {e}")
+
     if not volte_available:
         st.warning(f"No VoLTE subscribers (TICK=215) found for {cdr_date_str}.")
     else:
@@ -2518,6 +2555,34 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
         with col5:
             st.metric("IPW Node Issues", f"{cnt_ipw_missing_node + cnt_ipw_mismatch:,}",
                        help="Missing from some IPW node(s) or NAPTR pattern mismatch across nodes")
+
+        st.markdown("---")
+
+        # ---- Reverse check: provisioning drift (in IPW, but not TICK=215) ----
+        # Kept separate from Total TICK=215 / Healthy / Unhealthy above, since this
+        # population is outside that base (they don't have TICK=215 in UDC at all).
+        # Not counted as unhealthy — shown here for visibility, and available in the
+        # issue filter below for export.
+        st.markdown("**Reverse Check — Provisioning Drift:**")
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        with rc1:
+            st.metric(
+                "In IPW, No TICK=215",
+                f"{cnt_ipw_no_tick215:,}",
+                help="Present in at least one IPW node file (MSISDN starting with 201), "
+                     "but not TICK=215 in UDC (either a different TICK value or missing "
+                     "from UDC entirely that day). Not counted in the Unhealthy % above."
+            )
+        with rc2:
+            st.metric("Found in SIPW", f"{cnt_drift_sipw:,}",
+                       help="Of the above, how many were found in the SIPW file")
+        with rc3:
+            st.metric("Found in KIPW", f"{cnt_drift_kipw:,}",
+                       help="Of the above, how many were found in the KIPW file")
+        with rc4:
+            st.metric("Found in YIPW", f"{cnt_drift_yipw:,}",
+                       help="Of the above, how many were found in the YIPW file")
+        st.caption("A subscriber can appear in more than one file, so the three file counts may not sum to the total.")
 
         st.markdown("---")
 
@@ -2661,7 +2726,7 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
             "no EPS profile — so this list always matches the metrics above."
         )
 
-        if cnt_unhealthy == 0:
+        if cnt_unhealthy == 0 and cnt_ipw_no_tick215 == 0:
             st.success("All VoLTE subscribers are fully healthy.")
         else:
             # Issue type filter
@@ -2673,6 +2738,7 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                 "Not in Any IPW File (TICK=215 but absent from IPW)",
                 "Missing from Some IPW Node(s)",
                 "NAPTR Pattern Mismatch Across IPW Nodes",
+                "In IPW, No TICK=215 (Provisioning Drift)",
             ], key="recon_filter")
 
             # Build WHERE clause based on filter
@@ -2700,95 +2766,146 @@ ON d.MSISDN = ipw.msisdn        """, cdr_date_str, "volte_health_summary")
                     AND ifNull(ipw.status, '') = 'OK'
                 )"""
 
-            try:
-                misc_rows, _ = run_cached_query(f"""
-                    SELECT
-                        d.MSISDN,
-                        d.IMSI,
-                        d.EpsProfileId,
-                        d.EpsIndMappingContextId,
-                        d.IMPI,
-                        multiIf(
-                            d.EpsProfileId = '' OR d.EpsProfileId IS NULL, 'No EPS Profile',
-                            d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586'), 'Wrong APN Mapping',
-                            d.IMPI = '' OR d.IMPI IS NULL, 'No IMS Identity',
-                            '-'
-                        ) AS udc_issue,
-                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_sipw, 'Y', 'N')) AS SIPW,
-                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_kipw, 'Y', 'N')) AS KIPW,
-                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
-                        multiIf(
-                            ipw.msisdn IS NULL OR ipw.msisdn = '', 'Not in IPW',
-                            ipw.status = 'MISSING', 'Missing from Node(s)',
-                            ipw.status = 'PATTERN_MISMATCH', 'NAPTR Mismatch',
-                            'OK'
-                        ) AS ipw_status
-                    FROM default.dump AS d
-                    LEFT JOIN (
-                        SELECT * FROM default.ipw_reconciliation
-                        WHERE process_date = (SELECT max(process_date) FROM default.ipw_reconciliation)
-                    ) AS ipw ON d.MSISDN = ipw.msisdn
-                    WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
-                        {issue_where}
-                    ORDER BY d.MSISDN
-                    LIMIT 1000
-                """)
-                if misc_rows:
-                    df_misc = pd.DataFrame(misc_rows, columns=[
-                        'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
-                        'UDC Issue', 'SIPW', 'KIPW', 'YIPW', 'IPW Status'
-                    ])
-                    st.caption(f"Showing first {len(df_misc):,} results")
-                    st.dataframe(df_misc, use_container_width=True, height=400)
-                else:
-                    st.info("No subscribers found for this filter.")
+            is_drift_filter = (issue_filter == "In IPW, No TICK=215 (Provisioning Drift)")
 
-                # Download
-                dl_rows, _ = run_cached_query(f"""
-                    SELECT
-                        d.MSISDN, d.IMSI, d.EpsProfileId, d.EpsIndMappingContextId, d.IMPI,
-                        multiIf(
-                            d.EpsProfileId = '' OR d.EpsProfileId IS NULL, 'No EPS Profile',
-                            d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586'), 'Wrong APN Mapping',
-                            d.IMPI = '' OR d.IMPI IS NULL, 'No IMS Identity',
-                            '-'
-                        ) AS udc_issue,
-                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_sipw, 'Y', 'N')) AS SIPW,
-                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_kipw, 'Y', 'N')) AS KIPW,
-                        if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
-                            if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
-                        multiIf(
-                            ipw.msisdn IS NULL OR ipw.msisdn = '', 'Not in IPW',
-                            ipw.status = 'MISSING', 'Missing from Node(s)',
-                            ipw.status = 'PATTERN_MISMATCH', 'NAPTR Mismatch',
-                            'OK'
-                        ) AS ipw_status
-                    FROM default.dump AS d
-                    LEFT JOIN (
-                        SELECT * FROM default.ipw_reconciliation
-                        WHERE process_date = (SELECT max(process_date) FROM default.ipw_reconciliation)
-                    ) AS ipw ON d.MSISDN = ipw.msisdn
-                    WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
-                        {issue_where}
-                    ORDER BY d.MSISDN
-                    LIMIT 100000
-                """)
-                if dl_rows:
-                    df_dl = pd.DataFrame(dl_rows, columns=[
-                        'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
-                        'UDC Issue', 'SIPW', 'KIPW', 'YIPW', 'IPW Status'
-                    ])
-                    st.download_button(
-                        label="Download Misconfigured VoLTE Users (CSV)",
-                        data=df_dl.to_csv(index=False),
-                        file_name=f"volte_unhealthy_{cdr_date_str}.csv",
-                        mime='text/csv'
-                    )
+            try:
+                if is_drift_filter:
+                    # Reverse-check population: driven by IPW, not by UDC/TICK=215,
+                    # so it needs its own query shape rather than reusing issue_where.
+                    drift_query = f"""
+                        SELECT
+                            ipw.msisdn AS MSISDN,
+                            if(d.MSISDN IS NULL OR d.MSISDN = '', 'Not in UDC', d.TICK) AS udc_tick_value,
+                            if(ipw.in_sipw = 1, 'Y', 'N') AS SIPW,
+                            if(ipw.in_kipw = 1, 'Y', 'N') AS KIPW,
+                            if(ipw.in_yipw = 1, 'Y', 'N') AS YIPW
+                        FROM
+                        (
+                            SELECT msisdn, in_sipw, in_kipw, in_yipw
+                            FROM default.ipw_reconciliation
+                            WHERE process_date = (SELECT max(process_date) FROM default.ipw_reconciliation)
+                            AND msisdn LIKE '201%'
+                        ) ipw
+                        LEFT JOIN
+                        (
+                            SELECT MSISDN, TICK
+                            FROM default.dump
+                            WHERE CDRtime = '{cdr_date_str_dash}'
+                        ) d ON ipw.msisdn = d.MSISDN
+                        WHERE d.TICK IS NULL OR d.TICK != '215'
+                        ORDER BY ipw.msisdn
+                    """
+                    misc_rows, _ = run_cached_query(drift_query + " LIMIT 1000")
+                    if misc_rows:
+                        df_misc = pd.DataFrame(misc_rows, columns=[
+                            'MSISDN', 'UDC TICK Value', 'SIPW', 'KIPW', 'YIPW'
+                        ])
+                        st.caption(f"Showing first {len(df_misc):,} results")
+                        st.dataframe(df_misc, use_container_width=True, height=400)
+                    else:
+                        st.info("No subscribers found for this filter.")
+
+                    dl_rows, _ = run_cached_query(drift_query + " LIMIT 100000")
+                    if dl_rows:
+                        df_dl = pd.DataFrame(dl_rows, columns=[
+                            'MSISDN', 'UDC TICK Value', 'SIPW', 'KIPW', 'YIPW'
+                        ])
+                        st.download_button(
+                            label="Download Provisioning Drift Users (CSV)",
+                            data=df_dl.to_csv(index=False),
+                            file_name=f"volte_ipw_drift_{cdr_date_str}.csv",
+                            mime='text/csv'
+                        )
+
+                else:
+                    misc_rows, _ = run_cached_query(f"""
+                        SELECT
+                            d.MSISDN,
+                            d.IMSI,
+                            d.EpsProfileId,
+                            d.EpsIndMappingContextId,
+                            d.IMPI,
+                            multiIf(
+                                d.EpsProfileId = '' OR d.EpsProfileId IS NULL, 'No EPS Profile',
+                                d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586'), 'Wrong APN Mapping',
+                                d.IMPI = '' OR d.IMPI IS NULL, 'No IMS Identity',
+                                '-'
+                            ) AS udc_issue,
+                            if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                                if(ipw.in_sipw, 'Y', 'N')) AS SIPW,
+                            if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                                if(ipw.in_kipw, 'Y', 'N')) AS KIPW,
+                            if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                                if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
+                            multiIf(
+                                ipw.msisdn IS NULL OR ipw.msisdn = '', 'Not in IPW',
+                                ipw.status = 'MISSING', 'Missing from Node(s)',
+                                ipw.status = 'PATTERN_MISMATCH', 'NAPTR Mismatch',
+                                'OK'
+                            ) AS ipw_status
+                        FROM default.dump AS d
+                        LEFT JOIN (
+                            SELECT * FROM default.ipw_reconciliation
+                            WHERE process_date = (SELECT max(process_date) FROM default.ipw_reconciliation)
+                        ) AS ipw ON d.MSISDN = ipw.msisdn
+                        WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
+                            {issue_where}
+                        ORDER BY d.MSISDN
+                        LIMIT 1000
+                    """)
+                    if misc_rows:
+                        df_misc = pd.DataFrame(misc_rows, columns=[
+                            'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
+                            'UDC Issue', 'SIPW', 'KIPW', 'YIPW', 'IPW Status'
+                        ])
+                        st.caption(f"Showing first {len(df_misc):,} results")
+                        st.dataframe(df_misc, use_container_width=True, height=400)
+                    else:
+                        st.info("No subscribers found for this filter.")
+
+                    # Download
+                    dl_rows, _ = run_cached_query(f"""
+                        SELECT
+                            d.MSISDN, d.IMSI, d.EpsProfileId, d.EpsIndMappingContextId, d.IMPI,
+                            multiIf(
+                                d.EpsProfileId = '' OR d.EpsProfileId IS NULL, 'No EPS Profile',
+                                d.EpsIndMappingContextId NOT IN ('15$2008300586', '15$1008300586'), 'Wrong APN Mapping',
+                                d.IMPI = '' OR d.IMPI IS NULL, 'No IMS Identity',
+                                '-'
+                            ) AS udc_issue,
+                            if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                                if(ipw.in_sipw, 'Y', 'N')) AS SIPW,
+                            if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                                if(ipw.in_kipw, 'Y', 'N')) AS KIPW,
+                            if(ipw.msisdn IS NULL OR ipw.msisdn = '', 'N/A',
+                                if(ipw.in_yipw, 'Y', 'N')) AS YIPW,
+                            multiIf(
+                                ipw.msisdn IS NULL OR ipw.msisdn = '', 'Not in IPW',
+                                ipw.status = 'MISSING', 'Missing from Node(s)',
+                                ipw.status = 'PATTERN_MISMATCH', 'NAPTR Mismatch',
+                                'OK'
+                            ) AS ipw_status
+                        FROM default.dump AS d
+                        LEFT JOIN (
+                            SELECT * FROM default.ipw_reconciliation
+                            WHERE process_date = (SELECT max(process_date) FROM default.ipw_reconciliation)
+                        ) AS ipw ON d.MSISDN = ipw.msisdn
+                        WHERE d.CDRtime = '{cdr_date_str_dash}' AND d.TICK = '215'
+                            {issue_where}
+                        ORDER BY d.MSISDN
+                        LIMIT 100000
+                    """)
+                    if dl_rows:
+                        df_dl = pd.DataFrame(dl_rows, columns=[
+                            'MSISDN', 'IMSI', 'EpsProfileId', 'EpsIndMappingContextId', 'IMPI',
+                            'UDC Issue', 'SIPW', 'KIPW', 'YIPW', 'IPW Status'
+                        ])
+                        st.download_button(
+                            label="Download Misconfigured VoLTE Users (CSV)",
+                            data=df_dl.to_csv(index=False),
+                            file_name=f"volte_unhealthy_{cdr_date_str}.csv",
+                            mime='text/csv'
+                        )
             except Exception as e:
                 st.error(f"Error loading misconfigured subscribers: {e}")
 
